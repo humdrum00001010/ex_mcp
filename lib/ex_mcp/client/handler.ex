@@ -1,0 +1,259 @@
+defmodule ExMCP.Client.Handler do
+  @moduledoc """
+  This module implements the standard MCP specification.
+
+  Behaviour for handling server-to-client requests in MCP.
+
+  The MCP protocol supports bi-directional communication where servers can
+  make requests to clients. This behaviour defines the callbacks that a
+  client handler must implement to respond to these requests.
+
+  ## Example
+
+      defmodule MyClientHandler do
+        @behaviour ExMCP.Client.Handler
+
+        @impl true
+        def init(args) do
+          {:ok, %{roots: [%{uri: "file:///home/user", name: "Home"}]}}
+        end
+
+        @impl true
+        def handle_ping(state) do
+          {:ok, %{}, state}
+        end
+
+        @impl true
+        def handle_list_roots(state) do
+          {:ok, state.roots, state}
+        end
+
+        @impl true
+        def handle_create_message(params, state) do
+          # Show to user for approval, then sample LLM
+          case get_user_approval(params) do
+            :approved ->
+              result = sample_llm(params)
+              {:ok, result, state}
+            :denied ->
+              {:error, "User denied the request", state}
+          end
+        end
+      end
+  """
+
+  @type state :: any()
+  @type error_info :: String.t() | map()
+
+  @doc """
+  Called when the client handler is started.
+
+  Return `{:ok, state}` to initialize the handler state.
+  """
+  @callback init(args :: any()) :: {:ok, state}
+
+  @doc """
+  Handles a ping request from the server.
+
+  The client should respond promptly to indicate it's still alive.
+
+  ## Response
+
+  - `{:ok, result, new_state}` - Success with empty result
+  - `{:error, reason, new_state}` - Error occurred
+  """
+  @callback handle_ping(state) ::
+              {:ok, map(), state}
+              | {:error, error_info, state}
+
+  @doc """
+  Handles a request to list the client's root directories.
+
+  This is called when the server needs to understand what file system
+  locations the client has access to.
+
+  ## Response
+
+  The roots should be a list of maps with:
+  - `uri` (required) - The URI of the root (must start with "file://")
+  - `name` (optional) - Human-readable name for the root
+
+  ## Example
+
+      def handle_list_roots(state) do
+        roots = [
+          %{uri: "file:///home/user", name: "Home"},
+          %{uri: "file:///projects", name: "Projects"}
+        ]
+        {:ok, roots, state}
+      end
+  """
+  @callback handle_list_roots(state) ::
+              {:ok, [map()], state}
+              | {:error, error_info, state}
+
+  @doc """
+  Handles a request from the server to sample an LLM.
+
+  The client has full discretion over which model to select and should
+  inform the user before beginning sampling (human in the loop).
+
+  ## Parameters
+
+  The params map contains:
+  - `messages` - List of messages to send to the LLM
+  - `modelPreferences` (optional) - Server's model preferences
+  - `systemPrompt` (optional) - System prompt to use
+  - `includeContext` (optional) - Whether to include MCP context
+  - `temperature` (optional) - Sampling temperature
+  - `maxTokens` (optional) - Maximum tokens to sample
+  - `tools` (optional, 2025-11-25) - List of tool definitions the LLM may call.
+    Each tool has `name`, `description`, and `inputSchema` fields.
+  - `toolChoice` (optional, 2025-11-25) - Controls how the LLM uses tools.
+    A map with a `type` key: `"auto"`, `"none"`, or `"tool"` (with `name`).
+
+  ## Response
+
+  The result should contain:
+  - `role` - The role of the created message (usually "assistant")
+  - `content` - The content of the message. May include `tool_use` and
+    `tool_result` content blocks when tools are provided.
+  - `model` - The model that was used
+
+  ## Human-in-the-Loop
+
+  This callback MUST implement human-in-the-loop approval. The handler can
+  use the `ExMCP.Approval` behaviour for this, or implement its own approval
+  mechanism. The user must be informed about the sampling request and have
+  the opportunity to approve or deny it.
+
+  ## Example
+
+      def handle_create_message(params, state) do
+        case get_user_approval(params) do
+          :approved ->
+            result = %{
+              role: "assistant",
+              content: %{type: "text", text: "Hello!"},
+              model: "gpt-4"
+            }
+            {:ok, result, state}
+          :denied ->
+            {:error, "User denied sampling request", state}
+        end
+      end
+
+  ## Example with Tool Calling (2025-11-25)
+
+      def handle_create_message(%{"tools" => tools} = params, state) when is_list(tools) do
+        # Pass tools to the LLM and handle tool_use responses
+        result = %{
+          role: "assistant",
+          content: %{type: "tool_use", id: "call_1", name: "get_weather", input: %{"city" => "NYC"}},
+          model: "gpt-4"
+        }
+        {:ok, result, state}
+      end
+  """
+  @callback handle_create_message(params :: map(), state) ::
+              {:ok, map(), state}
+              | {:error, error_info, state}
+
+  @doc """
+  Handles an elicitation request from the server.
+
+  This is a stable protocol feature available in MCP 2025-06-18 and later.
+  The server is requesting additional information from the user through a 
+  structured form with JSON schema validation.
+
+  ## Parameters
+
+  - `message` - Human-readable message explaining what information is needed
+  - `requested_schema` - JSON schema defining the expected response structure
+
+  ## Response
+
+  The result should contain:
+  - `action` - One of "accept", "decline", or "cancel"
+  - `content` (optional) - The user's response data (only for "accept")
+
+  ## Example
+
+      def handle_elicitation_create(message, requested_schema, state) do
+        # Present the elicitation to the user
+        case present_elicitation_to_user(message, requested_schema) do
+          {:accept, data} ->
+            {:ok, %{action: "accept", content: data}, state}
+          :decline ->
+            {:ok, %{action: "decline"}, state}
+          :cancel ->
+            {:ok, %{action: "cancel"}, state}
+        end
+      end
+  """
+  @callback handle_elicitation_create(message :: String.t(), requested_schema :: map(), state) ::
+              {:ok, map(), state}
+              | {:error, error_info, state}
+
+  @doc """
+  Handles a URL-mode elicitation request from the server.
+
+  Instead of a form schema, the server sends a URL for the client to navigate to.
+  Available in protocol version 2025-11-25.
+
+  ## Parameters
+
+  - `message` - Human-readable message explaining what information is needed
+  - `url` - URL for the client to open/navigate to
+
+  ## Response
+
+  Same as handle_elicitation_create - action and optional content.
+  """
+  @callback handle_url_elicitation(message :: String.t(), url :: String.t(), state) ::
+              {:ok, map(), state}
+              | {:error, error_info, state}
+
+  @doc """
+  Handles a task status notification from the server.
+
+  Called when the server sends a notification about a task state change.
+  Available in protocol version 2025-11-25.
+  """
+  @callback handle_task_status(notification :: map(), state) ::
+              {:ok, state}
+              | {:error, error_info, state}
+
+  @doc """
+  Called when the handler process is about to terminate.
+  """
+  @callback terminate(reason :: term(), state) :: :ok
+
+  @doc """
+  Generic handler for any server-initiated request not handled by a specific callback.
+
+  This is called when the server sends a request (e.g., a future MCP method) that
+  doesn't have a dedicated handler callback. Implement this to handle custom or
+  new server methods without waiting for library updates.
+
+  ## Parameters
+
+  - `method` — the JSON-RPC method name (e.g., "sampling/createMessage")
+  - `params` — the request parameters map
+  - `state` — the handler state
+
+  ## Return Values
+
+  - `{:ok, result, new_state}` — success, result is sent back as JSON-RPC response
+  - `{:error, error_info, new_state}` — error, sent as JSON-RPC error response
+  """
+  @callback handle_server_request(method :: String.t(), params :: map(), state) ::
+              {:ok, result :: map(), state}
+              | {:error, error_info, state}
+
+  @optional_callbacks terminate: 2,
+                      handle_elicitation_create: 3,
+                      handle_url_elicitation: 3,
+                      handle_task_status: 2,
+                      handle_server_request: 3
+end
