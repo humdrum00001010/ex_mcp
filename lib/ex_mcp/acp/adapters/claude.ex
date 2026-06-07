@@ -285,24 +285,33 @@ defmodule ExMCP.ACP.Adapters.Claude do
     process_result(result, state)
   end
 
-  # System/status events from Claude CLI
-  defp process_event(%{"type" => "system"} = event, state) do
-    # Claude CLI sends system events for status updates (compaction, etc.)
-    case event["message"] do
-      nil ->
-        {:skip, state}
-
-      message ->
-        notification =
-          session_update(state.session_id, %{
-            "sessionUpdate" => "status",
-            "status" => "info",
-            "message" => message
-          })
-
-        {:messages, [notification], state}
-    end
+  # System/status events from Claude CLI.
+  #
+  # Claude CLI's stream-json `system` events are keyed by a `subtype` field
+  # (NOT a `message` field) — `init`, `api_retry`, `compact_boundary`, … The
+  # prior implementation only matched `event["message"]`, so EVERY real system
+  # event (which has `subtype`, not `message`) fell through to `{:skip, state}`
+  # and was silently dropped — including `api_retry`, the CLI's own
+  # rate-limit/transient-error backoff signal. Dispatch on `subtype` instead.
+  defp process_event(%{"type" => "system", "subtype" => subtype} = event, state) do
+    process_system_subtype(subtype, event, state)
   end
+
+  # Older/alternate shape: a `system` event that carries a free-form `message`
+  # instead of a `subtype`. Preserve the original behavior for that case.
+  defp process_event(%{"type" => "system", "message" => message}, state)
+       when not is_nil(message) do
+    notification =
+      session_update(state.session_id, %{
+        "sessionUpdate" => "status",
+        "status" => "info",
+        "message" => message
+      })
+
+    {:messages, [notification], state}
+  end
+
+  defp process_event(%{"type" => "system"}, state), do: {:skip, state}
 
   # Rate limit events
   defp process_event(%{"type" => "rate_limit_event"} = event, state) do
@@ -316,7 +325,89 @@ defmodule ExMCP.ACP.Adapters.Claude do
     {:messages, [notification], state}
   end
 
-  defp process_event(_event, state) do
+  # Catch-all for unrecognized top-level events. The prior version dropped these
+  # SILENTLY (no log), so a new content-bearing Claude CLI message type would
+  # vanish with no breadcrumb. Log at :debug so it's an intentional, traceable
+  # pass-through. Streaming/lifecycle subtypes (message_start/delta/stop) are
+  # already intentionally skipped in `process_stream_event/2`; the authoritative
+  # usage + stop_reason arrive in the `result` event.
+  defp process_event(event, state) do
+    Logger.debug("[Claude Adapter] Skipping unhandled event type: #{inspect(event["type"])}")
+    {:skip, state}
+  end
+
+  # ── system subtype handlers ───────────────────────────────────
+
+  # `init`: session bootstrap — carries session_id, model, available tools,
+  # mcp_servers. Capture session_id/model into state (so subsequent updates and
+  # the final result use the right session id) and surface an informational
+  # status so the UI can show which model/MCP servers the turn is running with.
+  defp process_system_subtype("init", event, state) do
+    state =
+      state
+      |> maybe_set(:session_id, event["session_id"])
+      |> maybe_set(:model, event["model"])
+
+    notification =
+      session_update(state.session_id, %{
+        "sessionUpdate" => "status",
+        "status" => "info",
+        "subtype" => "init",
+        "model" => event["model"],
+        "mcpServers" => event["mcp_servers"]
+      })
+
+    {:messages, [notification], state}
+  end
+
+  # `api_retry`: the CLI hit a transient/rate-limit error and is backing off.
+  # Previously dropped entirely (it has `subtype`, not `message`). Surface it as
+  # a `rate_limited` status carrying the retry metadata so the UI can show the
+  # backoff instead of appearing frozen.
+  defp process_system_subtype("api_retry", event, state) do
+    notification =
+      session_update(state.session_id, %{
+        "sessionUpdate" => "status",
+        "status" => "rate_limited",
+        "subtype" => "api_retry",
+        "attempt" => event["attempt"],
+        "maxRetries" => event["max_retries"],
+        "retryAfter" => event["retry_delay_ms"],
+        "errorStatus" => event["error_status"],
+        "message" => event["error"]
+      })
+
+    {:messages, [notification], state}
+  end
+
+  # `compact_boundary`: the CLI auto-compacted the context window mid-session.
+  defp process_system_subtype("compact_boundary", event, state) do
+    notification =
+      session_update(state.session_id, %{
+        "sessionUpdate" => "status",
+        "status" => "compacting",
+        "subtype" => "compact_boundary",
+        "trigger" => event["compact_metadata"]["trigger"] || event["trigger"]
+      })
+
+    {:messages, [notification], state}
+  rescue
+    # `compact_metadata` shape varies / may be absent across CLI versions — never
+    # let a missing key crash the turn; emit the status without the trigger.
+    _ ->
+      {:messages,
+       [
+         session_update(state.session_id, %{
+           "sessionUpdate" => "status",
+           "status" => "compacting",
+           "subtype" => "compact_boundary"
+         })
+       ], state}
+  end
+
+  # Any other system subtype: intentional, traceable skip (not a silent drop).
+  defp process_system_subtype(subtype, _event, state) do
+    Logger.debug("[Claude Adapter] Skipping system subtype: #{inspect(subtype)}")
     {:skip, state}
   end
 
@@ -339,7 +430,12 @@ defmodule ExMCP.ACP.Adapters.Claude do
     {:skip, state}
   end
 
-  defp process_stream_event(_event, state) do
+  # Other stream subtypes (message_start, message_delta, message_stop). These
+  # carry incremental stop_reason/usage that we don't need here — the `result`
+  # event provides the authoritative usage and stop_reason. Intentional skip,
+  # logged at :debug as a breadcrumb (was a silent drop).
+  defp process_stream_event(event, state) do
+    Logger.debug("[Claude Adapter] Skipping stream subtype: #{inspect(event["type"])}")
     {:skip, state}
   end
 

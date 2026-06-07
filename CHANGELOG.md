@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - fork (humdrum00001010/ex_mcp)
+
+### Fixed
+- **Codex adapter** — `account/rateLimits/updated` notifications are now handled
+  instead of falling through the catch-all as "Unhandled" and being dropped. The
+  `RateLimitSnapshot` (primary/secondary windows, credits, plan type) is forwarded
+  defensively as a `session/update` with a `"rate_limit"` variant, so the session/UI
+  can see the rate-limit window/remaining/reset. The catch-all log now reads as an
+  intentional "Skipping unsurfaced notification" pass-through.
+- **Claude adapter** — `system` events are dispatched on their `subtype` field
+  (`init`, `api_retry`, `compact_boundary`) instead of an absent `message` field.
+  Previously every `system` event (which carries `subtype`, not `message`) was
+  silently dropped — including `api_retry`, the CLI's rate-limit/backoff signal.
+  `init` now captures session_id/model and surfaces an info status; `api_retry`
+  surfaces a `rate_limited` status with retry metadata; `compact_boundary` surfaces
+  a `compacting` status. The top-level and stream-event catch-alls now log a
+  `:debug` breadcrumb instead of dropping silently.
+- **Pi adapter** — catch-all reworded to an intentional "Skipping unhandled event"
+  pass-through (behavior unchanged; it already logged + skipped).
+
+### Added
+- **Adapter notification tests** — `test/ex_mcp/acp/adapters/notification_test.exs`
+  covers Codex `account/rateLimits/updated` (incl. defensive empty-payload handling)
+  and Claude `system` subtype dispatch.
+
 ## [0.10.0] - 2026-05-29
 
 ### Added

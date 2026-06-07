@@ -1,0 +1,15 @@
+# Build artifacts (created when this fork is checked out / tested standalone)
+/_build/
+/deps/
+/cover/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+*.beam
+/config/*.secret.exs
+.elixir_ls/
+
+# Dependency lockfile: this is a library/git-dep — the lock is resolved by the
+# parent app (ecrits), not pinned here.
+/mix.lock

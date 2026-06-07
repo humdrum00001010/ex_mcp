@@ -824,9 +824,14 @@ defmodule ExMCP.ACP.Adapters.Pi do
     {:skip, state}
   end
 
-  # Catch-all
+  # Catch-all: intentional, traceable skip for any Pi event without an explicit
+  # clause. Pi's content-bearing events (message_update text/thinking/tool_call,
+  # tool_execution_*, agent_end, auto_compaction_*, auto_retry_*, RPC responses,
+  # extension UI) are all handled above; lifecycle events are skipped explicitly.
+  # Logged at :debug so a new content-bearing event leaves a breadcrumb rather
+  # than vanishing silently.
   defp process_event(event, state) do
-    Logger.debug("[Pi Adapter] Unhandled: #{inspect(Map.get(event, "type"))}")
+    Logger.debug("[Pi Adapter] Skipping unhandled event: #{inspect(Map.get(event, "type"))}")
     {:skip, state}
   end
 

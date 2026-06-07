@@ -524,8 +524,8 @@ defmodule ExMCP.ACP.Adapters.Codex do
       "[Codex Adapter] mcpServer/elicitation/request -> #{action} (#{params["serverName"]})"
     )
 
-    {:skip_and_write, jsonrpc_result(id, %{"action" => action, "content" => content, "_meta" => nil}),
-     state}
+    {:skip_and_write,
+     jsonrpc_result(id, %{"action" => action, "content" => content, "_meta" => nil}), state}
   end
 
   defp handle_server_request(method, id, _params, state)
@@ -546,7 +546,9 @@ defmodule ExMCP.ACP.Adapters.Codex do
   # Any other server request we don't explicitly model: reply with a JSON-RPC
   # error so the app-server stops blocking (rather than hanging the turn forever).
   defp handle_server_request(method, id, _params, state) do
-    Logger.debug("[Codex Adapter] Unhandled server request: #{method} (replying method_not_found)")
+    Logger.debug(
+      "[Codex Adapter] Unhandled server request: #{method} (replying method_not_found)"
+    )
 
     error = %{
       "jsonrpc" => "2.0",
@@ -827,6 +829,48 @@ defmodule ExMCP.ACP.Adapters.Codex do
     {:messages, [notification], state}
   end
 
+  # ── Account / Rate-Limit Notifications ────────────────────────
+  #
+  # Codex 0.137 app-server emits `account/rateLimits/updated` whenever the
+  # user's ChatGPT rate-limit window changes (during/after a turn, or on
+  # connect). Its params are an `AccountRateLimitsUpdatedNotification`
+  # (codex-rs `app-server-protocol` v2):
+  #
+  #   { "rateLimits": {                         # RateLimitSnapshot, camelCase
+  #       "limitId": str|null, "limitName": str|null,
+  #       "primary":   { "usedPercent": int,    # RateLimitWindow
+  #                      "windowDurationMins": int|null,
+  #                      "resetsAt": int|null } | null,
+  #       "secondary": { ... } | null,
+  #       "credits": { "hasCredits": bool, "unlimited": bool,
+  #                    "balance": str|null } | null,
+  #       "individualLimit": {...} | null,
+  #       "planType": str|null,
+  #       "rateLimitReachedType": str|null } }
+  #
+  # Previously this fell through the catch-all and was DROPPED ("Unhandled
+  # notification: account/rateLimits/updated"), so the session/UI never learned
+  # how close the user was to a limit or when the window resets. Surface it the
+  # same way usage is surfaced — as a structured `session/update`, here with a
+  # `"rate_limit"` variant. We forward the snapshot DEFENSIVELY: whatever
+  # `rateLimits` map arrives (the exact shape can vary across codex versions /
+  # account types) is passed through under `content` without indexing into it,
+  # so an unexpected/empty shape can never crash the turn. The ecrits session
+  # layer (`acp_stream.map_update/2`) skips unknown `sessionUpdate` variants, so
+  # this is non-breaking there while remaining available to any consumer that
+  # wants to display the rate-limit window/remaining/reset.
+  defp handle_notification("account/rateLimits/updated", params, state) do
+    rate_limits = params["rateLimits"] || params["rate_limits"] || params
+
+    notification =
+      session_update(state, %{
+        "sessionUpdate" => "rate_limit",
+        "content" => rate_limits
+      })
+
+    {:messages, [notification], state}
+  end
+
   # ── Error Notifications ───────────────────────────────────────
 
   defp handle_notification("error", params, state) do
@@ -871,9 +915,18 @@ defmodule ExMCP.ACP.Adapters.Codex do
     {:messages, [notification], state}
   end
 
-  # Catch-all for unknown notifications
+  # Intentional skip for the long tail of codex notifications we don't surface:
+  # experimental/internal events (`thread/realtime/*`, `rawResponseItem/completed`,
+  # `fuzzyFileSearch/*`, `process/*`), lifecycle/no-content notices
+  # (`account/updated`, `model/rerouted`, `warning`, `deprecationNotice`,
+  # `configWarning`, `mcpServer/startupStatus/updated`, …). None of these carry
+  # turn output the chat-rail needs; the high-signal ones with content
+  # (text/reasoning deltas, items, command exec, usage, rate limits, errors) all
+  # have explicit clauses above. Logged at :debug so it's clearly an intentional
+  # pass-through, not a protocol gap — if a NEW content-bearing notification
+  # shows up here, that debug line is the breadcrumb to add a clause for it.
   defp handle_notification(method, _params, state) do
-    Logger.debug("[Codex Adapter] Unhandled notification: #{method}")
+    Logger.debug("[Codex Adapter] Skipping unsurfaced notification: #{method}")
     {:skip, state}
   end
 
