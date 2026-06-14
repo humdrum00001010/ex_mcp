@@ -250,9 +250,7 @@ defmodule ExMCP.MessageProcessor do
           process_with_server_pid(conn, server_pid, server_info)
         after
           # Clean up the temporary server
-          if Process.alive?(server_pid) do
-            GenServer.stop(server_pid, :normal, 1000)
-          end
+          stop_temporary_server(server_pid)
         end
 
       {:error, reason} ->
@@ -280,9 +278,7 @@ defmodule ExMCP.MessageProcessor do
           process_handler_request(conn, server_pid, server_info)
         after
           # Clean up the temporary server
-          if Process.alive?(server_pid) do
-            GenServer.stop(server_pid, :normal, 1000)
-          end
+          stop_temporary_server(server_pid)
         end
 
       {:error, reason} ->
@@ -313,6 +309,35 @@ defmodule ExMCP.MessageProcessor do
   defp start_temporary_server(handler_module) do
     # Start a temporary GenServer instance
     handler_module.start_link([])
+  end
+
+  # Best-effort teardown of a per-request handler/server GenServer.
+  #
+  # By the time this runs (inside the enclosing `try/after`) the JSON response
+  # for the request is ALREADY built and is the value the `try` returns — this
+  # is pure cleanup. A handler that is slow to terminate (e.g. it just did a
+  # heavy tool call like a document export + disk write) must therefore NEVER
+  # turn a successful tool result into a transport error.
+  #
+  # `GenServer.stop/3` exits the CALLING process with `:timeout` if the handler
+  # doesn't terminate within the budget; letting that escape the `after` discards
+  # the built response and 500s the request (the client then sees a non-JSON
+  # error page). So: give terminate real headroom, swallow a stop timeout, and
+  # hard-kill as the backstop. The handler was `start_link`'d to us, so unlink
+  # before `:kill` — otherwise the signal propagates back through the link and
+  # crashes the very request we are trying to answer.
+  defp stop_temporary_server(server_pid) do
+    if Process.alive?(server_pid) do
+      try do
+        GenServer.stop(server_pid, :normal, 5_000)
+      catch
+        :exit, _ ->
+          Process.unlink(server_pid)
+          Process.exit(server_pid, :kill)
+      end
+    end
+
+    :ok
   end
 
   # Process request using Server handler (direct DSL module calls)
