@@ -62,6 +62,9 @@ defmodule ExMCP.ACP.Adapters.Claude do
     usage: nil,
     pending_prompt_id: nil,
     in_tool_use: false,
+    # tool_use id → tool name, so terminal updates (built from tool_result
+    # blocks, which only carry the id) can echo the toolName.
+    tool_names: %{},
     opts: []
   ]
 
@@ -589,20 +592,28 @@ defmodule ExMCP.ACP.Adapters.Claude do
     # Build full tool info matching Zed's toolInfoFromToolUse pattern
     tool_info = tool_info_from_use(tool_name, input, block["id"], state.cwd)
 
+    # The FIRST report of a call is the spec's `tool_call` (previously this
+    # was a `tool_call_update`, which clients rightly ignore for a call id
+    # they have never been introduced to — the call then only surfaced at its
+    # terminal update, after any streamed reply text). Remember id→name so
+    # the terminal update (built from a tool_result, which only carries the
+    # tool_use_id) can echo the toolName.
     update =
       %{
-        "sessionUpdate" => "tool_call_update",
+        "sessionUpdate" => "tool_call",
         "title" => tool_info.title,
         "toolCallId" => block["id"],
         "toolName" => tool_name,
         "kind" => tool_info.kind,
         "status" => "in_progress",
+        "rawInput" => input,
         "input" => input
       }
       |> maybe_put_tool("content", non_empty_list(tool_info.content))
       |> maybe_put_tool("locations", non_empty_list(tool_info.locations))
 
     notification = session_update(state.session_id, update)
+    state = %{state | tool_names: Map.put(state.tool_names, block["id"], tool_name)}
 
     {state, [notification]}
   end
@@ -741,6 +752,12 @@ defmodule ExMCP.ACP.Adapters.Claude do
         "isError" => is_error
       }
 
+      update =
+        case Map.get(state.tool_names, result["tool_use_id"]) do
+          nil -> update
+          name -> Map.put(update, "toolName", name)
+        end
+
       session_update(state.session_id, update)
     end)
   end
@@ -755,7 +772,8 @@ defmodule ExMCP.ACP.Adapters.Claude do
         thinking_blocks: [],
         current_block_type: nil,
         usage: nil,
-        in_tool_use: false
+        in_tool_use: false,
+        tool_names: %{}
     }
   end
 
