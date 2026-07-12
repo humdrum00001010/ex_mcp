@@ -84,7 +84,18 @@ defmodule ExMCP.ACP.Adapters.Claude do
       "--verbose",
       "--max-thinking-tokens",
       to_string(thinking_budget),
-      "--dangerously-skip-permissions"
+      "--dangerously-skip-permissions",
+      # Isolate the embedded agent from the USER's global Claude Code config.
+      # Without this the CLI loads ~/.claude settings: SessionStart hooks,
+      # plugins, skills, deferred-tool listings and global MCP servers all leak
+      # into every ACP turn — observed stalling a real turn for 9+ min when the
+      # model chased the host harness's ToolSearch meta-tool instead of the
+      # caller's MCP tools. Keychain/OAuth auth is unaffected (credentials are
+      # not a settings source). Only the --mcp-config servers we pass exist.
+      "--setting-sources",
+      "",
+      "--strict-mcp-config",
+      "--disable-slash-commands"
     ]
 
     args = append_optional(args, opts, :model, "--model")
@@ -403,6 +414,23 @@ defmodule ExMCP.ACP.Adapters.Claude do
            "subtype" => "compact_boundary"
          })
        ], state}
+  end
+
+  # `thinking_tokens`: periodic heartbeat while the model is in extended
+  # thinking (no content deltas stream during this phase). Previously dropped —
+  # which made a long thinking phase indistinguishable from a stalled turn, so
+  # idle-based ACP timeouts killed genuinely active design turns. Surface it as
+  # a `thinking` status: consumers register activity and UIs can show progress.
+  defp process_system_subtype("thinking_tokens", event, state) do
+    notification =
+      session_update(state.session_id, %{
+        "sessionUpdate" => "status",
+        "status" => "thinking",
+        "subtype" => "thinking_tokens",
+        "tokens" => event["tokens"] || event["thinking_tokens"] || event["token_count"]
+      })
+
+    {:messages, [notification], state}
   end
 
   # Any other system subtype: intentional, traceable skip (not a silent drop).
