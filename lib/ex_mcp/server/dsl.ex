@@ -60,7 +60,11 @@ defmodule ExMCP.Server.DSL do
   end
 
   defmacro __before_compile__(env) do
-    opts = Module.get_attribute(env.module, :ex_mcp_dsl_opts, [])
+    opts =
+      env.module
+      |> Module.get_attribute(:ex_mcp_dsl_opts, [])
+      |> evaluate_options!(env)
+
     tools = env.module |> Module.get_attribute(:ex_mcp_dsl_tools, []) |> Enum.reverse()
     resources = env.module |> Module.get_attribute(:ex_mcp_dsl_resources, []) |> Enum.reverse()
 
@@ -527,6 +531,16 @@ defmodule ExMCP.Server.DSL do
 
   defp eval_ast!(ast, env, context), do: eval_ast!(ast, env, context, nil)
 
+  defp evaluate_options!(opts, env) do
+    case Keyword.fetch(opts, :capabilities) do
+      {:ok, capabilities} ->
+        Keyword.put(opts, :capabilities, eval_ast!(capabilities, env, ":capabilities"))
+
+      :error ->
+        opts
+    end
+  end
+
   defp eval_ast!(ast, env, context, meta) do
     ast
     |> Macro.expand(env)
@@ -588,7 +602,12 @@ defmodule ExMCP.Server.DSL do
 
   defp generate_server_callbacks(module, opts, tools, resources, resource_templates, prompts) do
     server_info = server_info(module, opts)
-    capabilities = capabilities(tools, resources, resource_templates, prompts)
+
+    capabilities =
+      tools
+      |> capabilities(resources, resource_templates, prompts)
+      |> merge_capabilities(Keyword.get(opts, :capabilities, %{}))
+
     start_link_callback = generate_start_link_callback(server_info)
     initialize_callback = generate_initialize_callback(server_info, capabilities)
 
@@ -955,4 +974,28 @@ defmodule ExMCP.Server.DSL do
     do: Map.put(capabilities, key, value)
 
   defp maybe_put_capability(capabilities, false, _key, _value), do: capabilities
+
+  defp merge_capabilities(generated, explicit) when is_map(explicit) do
+    explicit = stringify_keys(explicit)
+
+    Map.merge(generated, explicit, fn _key, generated_value, explicit_value ->
+      if is_map(generated_value) and is_map(explicit_value) do
+        Map.merge(generated_value, explicit_value)
+      else
+        explicit_value
+      end
+    end)
+  end
+
+  defp merge_capabilities(_generated, explicit) do
+    raise ArgumentError,
+          "ExMCP.Server.DSL :capabilities must be a map, got: #{inspect(explicit)}"
+  end
+
+  defp stringify_keys(map) do
+    Map.new(map, fn {key, value} ->
+      value = if is_map(value), do: stringify_keys(value), else: value
+      {to_string(key), value}
+    end)
+  end
 end

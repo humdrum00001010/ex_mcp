@@ -3,7 +3,12 @@ defmodule ExMCP.Server.DSLTest do
 
   defmodule ModernServer do
     use ExMCP.Server.Handler
-    use ExMCP.Server.DSL
+
+    use ExMCP.Server.DSL,
+      capabilities: %{
+        resources: %{subscribe: true, listChanged: true},
+        tools: %{listChanged: true}
+      }
 
     tool "echo", "Echo back the input" do
       title("Echo Tool")
@@ -67,6 +72,19 @@ defmodule ExMCP.Server.DSLTest do
          }, state}
       end)
     end
+  end
+
+  test "merges explicitly declared wire capabilities with generated capabilities" do
+    assert {:ok, result, state} =
+             ModernServer.handle_initialize(%{"protocolVersion" => "2025-11-25"}, %{})
+
+    assert result["capabilities"] == %{
+             "prompts" => %{},
+             "resources" => %{"listChanged" => true, "subscribe" => true},
+             "tools" => %{"listChanged" => true}
+           }
+
+    assert state.protocol_version == "2025-11-25"
   end
 
   test "lists tools with generated schemas and spec-aligned metadata" do

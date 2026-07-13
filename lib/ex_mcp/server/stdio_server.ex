@@ -203,6 +203,13 @@ defmodule ExMCP.Server.StdioServer do
     end
   end
 
+  # MCP lifecycle notifications never receive a JSON-RPC response. The
+  # initialized notification only confirms that the client accepted the
+  # negotiated server capabilities, so there is no handler callback to run.
+  defp handle_request(%{"method" => "notifications/initialized"}, state) do
+    {:noreply, state}
+  end
+
   defp handle_request(%{"method" => "tools/list"} = request, state) do
     id = Map.get(request, "id")
     params = Map.get(request, "params", %{})
@@ -340,7 +347,10 @@ defmodule ExMCP.Server.StdioServer do
         end
 
       false ->
-        send_error_response(-32601, "Method not found: #{method}", id, state)
+        if Map.has_key?(request, "id") do
+          send_error_response(-32601, "Method not found: #{method}", id, state)
+        end
+
         {:noreply, state}
     end
   end
