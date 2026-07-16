@@ -112,8 +112,16 @@ defmodule ExMCP.ACP.Adapters.Codex do
     # so they must be injected here at launch.
     mcp_args = mcp_server_config_args(Keyword.get(opts, :mcp_servers))
     memory_args = memory_config_args(Keyword.get(opts, :disable_memories, false))
-    {"codex", ["app-server"] ++ memory_args ++ mcp_args}
+    command = {"codex", ["app-server"] ++ memory_args ++ mcp_args}
+    wrap_command(command, Keyword.get(opts, :command_wrapper))
   end
+
+  defp wrap_command({command, args}, {wrapper, wrapper_args})
+       when is_binary(wrapper) and is_list(wrapper_args) do
+    {wrapper, wrapper_args ++ [command | args]}
+  end
+
+  defp wrap_command(command, _wrapper), do: command
 
   # ACP hosts can opt out of Codex's personal memory store for an embedded
   # agent. This is process-local configuration, not a compensating prompt: it

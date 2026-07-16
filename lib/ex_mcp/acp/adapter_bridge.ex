@@ -208,7 +208,7 @@ defmodule ExMCP.ACP.AdapterBridge do
         :stderr_to_stdout,
         args: Enum.map(args, &to_charlist/1),
         cd: to_charlist(cwd),
-        env: safe_env()
+        env: safe_env(opts)
       ]
 
       try do
@@ -670,8 +670,28 @@ defmodule ExMCP.ACP.AdapterBridge do
     CLAUDECODE
   )
 
-  defp safe_env do
-    cleared = Enum.map(@session_vars_to_clear, &{to_charlist(&1), false})
-    [{~c"TERM", ~c"dumb"} | cleared]
+  defp safe_env(opts) do
+    provided = port_env(Keyword.get(opts, :env, []))
+    provided_names = MapSet.new(Enum.map(provided, &elem(&1, 0)))
+
+    base =
+      [{~c"TERM", ~c"dumb"} | Enum.map(@session_vars_to_clear, &{to_charlist(&1), false})]
+
+    Enum.reject(base, fn {name, _value} -> MapSet.member?(provided_names, name) end) ++ provided
   end
+
+  defp port_env(env) when is_list(env) do
+    Enum.flat_map(env, fn
+      {name, value} when is_binary(name) and (is_binary(value) or value == false) ->
+        [{to_charlist(name), if(is_binary(value), do: to_charlist(value), else: false)}]
+
+      {name, value} when is_list(name) and (is_list(value) or value == false) ->
+        [{name, value}]
+
+      _other ->
+        []
+    end)
+  end
+
+  defp port_env(_env), do: []
 end

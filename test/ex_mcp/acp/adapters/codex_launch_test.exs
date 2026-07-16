@@ -18,4 +18,11 @@ defmodule ExMCP.ACP.Adapters.CodexLaunchTest do
              "memories.generate_memories=false"
            ]
   end
+
+  test "can wrap the app server command without changing its arguments" do
+    assert {"sandbox-exec", ["-p", "(version 1)", "codex" | args]} =
+             Codex.command(command_wrapper: {"sandbox-exec", ["-p", "(version 1)"]})
+
+    assert args == ["app-server"]
+  end
 end
