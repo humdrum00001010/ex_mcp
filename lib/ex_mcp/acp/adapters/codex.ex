@@ -20,7 +20,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
   | ACP Message | Codex JSON-RPC |
   |---|---|
   | `session/new` | `thread/start` request |
-  | `session/load` | `thread/start` with threadId (resume) |
+  | `session/load` | `thread/resume` request |
   | `session/prompt` | `turn/start` request |
   | `session/cancel` | `turn/interrupt` request |
   | `item/agentMessage/delta` | `session/update` (text) |
@@ -51,10 +51,9 @@ defmodule ExMCP.ACP.Adapters.Codex do
 
   require Logger
 
-  # Seconds codex waits for an HTTP MCP server to finish its initial connect +
-  # `tools/list` before proceeding with the turn. Generous on purpose so the
-  # in-process doc server is RELIABLY ready (and its `doc.*` tools in context)
-  # rather than racing the first turn. See `mcp_server_overrides/1`.
+  # Seconds codex waits for an MCP server to finish its initial connect +
+  # `tools/list` before proceeding with the turn. These are sent in the
+  # per-thread `config.mcp_servers` override supported by Codex 0.144.5.
   @mcp_startup_timeout_sec 30
   # Seconds an individual MCP tool call may run before codex aborts it; doc.edit
   # on a large document can be slow, so give it room.
@@ -106,13 +105,8 @@ defmodule ExMCP.ACP.Adapters.Codex do
 
   @impl true
   def command(opts) do
-    # Forward MCP servers to the codex app-server as `-c` config overrides so the
-    # agent can discover + call them. Codex configures MCP servers at the
-    # app-server process level (TOML `[mcp_servers.<name>]`), not per thread/start,
-    # so they must be injected here at launch.
-    mcp_args = mcp_server_config_args(Keyword.get(opts, :mcp_servers))
     memory_args = memory_config_args(Keyword.get(opts, :disable_memories, false))
-    command = {"codex", ["app-server"] ++ memory_args ++ mcp_args}
+    command = {"codex", ["app-server"] ++ memory_args}
     wrap_command(command, Keyword.get(opts, :command_wrapper))
   end
 
@@ -138,76 +132,90 @@ defmodule ExMCP.ACP.Adapters.Codex do
 
   defp memory_config_args(_), do: []
 
-  # Build `-c key=value` overrides for each MCP server. HTTP (streamable) servers
-  # use `mcp_servers.<name>.url`; stdio servers use `.command`/`.args`. We also
-  # enable `features.rmcp_client` which codex 0.137 requires for HTTP (streamable)
-  # MCP transport — the in-process doc server is served over HTTP.
-  defp mcp_server_config_args(servers) when is_list(servers) and servers != [] do
-    base = ["-c", "features.rmcp_client=true"]
+  # ACP supplies MCP servers when a session is created or loaded. Codex 0.144.5
+  # accepts raw config overrides on both `thread/start` and `thread/resume`, so
+  # keep this configuration scoped to the thread instead of leaking it into the
+  # persistent app-server process. ACP's typed HTTP/stdio descriptors use lists
+  # of name/value pairs for headers and environment variables; Codex's config
+  # uses maps.
+  defp mcp_config(servers) when is_list(servers) do
+    servers =
+      Enum.reduce(servers, %{}, fn server, acc ->
+        case normalize_mcp_server(server) do
+          {name, config} -> Map.put(acc, name, config)
+          nil -> acc
+        end
+      end)
 
-    Enum.reduce(servers, base, fn server, acc ->
-      acc ++ mcp_server_overrides(normalize_mcp_server(server))
+    if map_size(servers) == 0, do: nil, else: %{"mcp_servers" => servers}
+  end
+
+  defp mcp_config(_servers), do: nil
+
+  defp normalize_mcp_server(%{} = server) do
+    name = server["name"] || server[:name]
+    url = server["url"] || server[:url]
+    command = server["command"] || server[:command]
+
+    cond do
+      is_binary(name) and name != "" and is_binary(url) and url != "" ->
+        config =
+          %{
+            "url" => url,
+            "startup_timeout_sec" => @mcp_startup_timeout_sec,
+            "tool_timeout_sec" => @mcp_tool_timeout_sec
+          }
+          |> maybe_put("http_headers", name_value_map(server["headers"] || server[:headers]))
+
+        {name, config}
+
+      is_binary(name) and name != "" and is_binary(command) and command != "" ->
+        config =
+          %{
+            "command" => command,
+            "startup_timeout_sec" => @mcp_startup_timeout_sec,
+            "tool_timeout_sec" => @mcp_tool_timeout_sec
+          }
+          |> maybe_put("args", string_list(server["args"] || server[:args]))
+          |> maybe_put("env", name_value_map(server["env"] || server[:env]))
+
+        {name, config}
+
+      true ->
+        nil
+    end
+  end
+
+  defp normalize_mcp_server(_server), do: nil
+
+  defp name_value_map(values) when is_list(values) do
+    Enum.reduce(values, %{}, fn
+      %{} = value, acc ->
+        name = value["name"] || value[:name]
+        content = value["value"] || value[:value]
+
+        if is_binary(name) and name != "" and is_binary(content) do
+          Map.put(acc, name, content)
+        else
+          acc
+        end
+
+      _value, acc ->
+        acc
     end)
   end
 
-  defp mcp_server_config_args(_servers), do: []
-
-  defp mcp_server_overrides(%{name: name, url: url}) when is_binary(url) and url != "" do
-    # `startup_timeout_sec`/`tool_timeout_sec` are per-server keys on codex's
-    # `RawMcpServerConfig` (verified against `codex app-server --strict-config`
-    # on 0.137). Codex connects to an HTTP (streamable) MCP server asynchronously
-    # and only surfaces its tools to the model once the connection is established
-    # and `tools/list` returns. With a short/default startup window, a slow first
-    # connect to the in-process doc server can race the turn: the model is handed
-    # ZERO `doc.*` tools, then hallucinates that "편집 MCP가 로드되지 않았습니다"
-    # and flails with codex's built-in MCP-listing tools instead of calling
-    # `doc.*`. A generous startup timeout makes codex WAIT for the doc server's
-    # tool list before the turn begins, so the tools are surfaced in context.
-    # `tool_timeout_sec` likewise gives the (sometimes slow) doc.edit call room to
-    # finish instead of being aborted mid-write. This is the deterministic config
-    # lever available here — `tool_search` is already removed/disabled by default
-    # on 0.137, so there is no per-server "always_available" toggle to flip; a
-    # generous eager-startup window is the closest equivalent.
-    [
-      "-c",
-      "mcp_servers.#{name}.url=#{toml_string(url)}",
-      "-c",
-      "mcp_servers.#{name}.startup_timeout_sec=#{@mcp_startup_timeout_sec}",
-      "-c",
-      "mcp_servers.#{name}.tool_timeout_sec=#{@mcp_tool_timeout_sec}"
-    ]
+  defp name_value_map(values) when is_map(values) do
+    Enum.reduce(values, %{}, fn
+      {name, value}, acc when is_binary(name) and is_binary(value) -> Map.put(acc, name, value)
+      _entry, acc -> acc
+    end)
   end
 
-  defp mcp_server_overrides(%{name: name, command: command} = server)
-       when is_binary(command) and command != "" do
-    args =
-      case server[:args] do
-        list when is_list(list) and list != [] ->
-          ["-c", "mcp_servers.#{name}.args=#{toml_array(list)}"]
+  defp name_value_map(_values), do: %{}
 
-        _ ->
-          []
-      end
-
-    ["-c", "mcp_servers.#{name}.command=#{toml_string(command)}"] ++ args
-  end
-
-  defp mcp_server_overrides(_server), do: []
-
-  defp normalize_mcp_server(%{} = server) do
-    %{
-      name: to_string(server["name"] || server[:name] || "mcp"),
-      url: server["url"] || server[:url],
-      command: server["command"] || server[:command],
-      args: server["args"] || server[:args]
-    }
-  end
-
-  defp toml_string(value), do: "\"" <> String.replace(to_string(value), "\"", "\\\"") <> "\""
-
-  defp toml_array(list) do
-    "[" <> Enum.map_join(list, ",", &toml_string/1) <> "]"
-  end
+  defp string_list(values) when is_list(values), do: Enum.filter(values, &is_binary/1)
+  defp string_list(_values), do: []
 
   @impl true
   def capabilities do
@@ -285,6 +293,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
       |> maybe_put("cwd", params["cwd"] || Keyword.get(state.opts, :cwd))
       |> maybe_put("approvalPolicy", params["approvalPolicy"])
       |> maybe_put("sandbox", thread_sandbox(params, state))
+      |> maybe_put("config", mcp_config(params["mcpServers"]))
 
     request = encode_request(id, "thread/start", wire_params)
     state = track_request(state, id, :thread_start, acp_id)
@@ -309,6 +318,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
         %{"threadId" => session_id}
         |> maybe_put("model", state.model || params["model"])
         |> maybe_put("cwd", params["cwd"] || Keyword.get(state.opts, :cwd))
+        |> maybe_put("config", mcp_config(params["mcpServers"]))
 
       request = encode_request(id, "thread/resume", wire_params)
       state = track_request(state, id, :thread_start, acp_id)
