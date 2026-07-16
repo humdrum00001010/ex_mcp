@@ -638,6 +638,19 @@ defmodule ExMCP.ACP.Adapters.Codex do
     {:messages, [notification], state}
   end
 
+  # Codex 0.144 emits the user-facing reasoning summary on this newer
+  # notification name. Keep it on the same ACP path as the original
+  # `textDelta` stream so consumers receive one ordered thought stream.
+  defp handle_notification("item/reasoning/summaryTextDelta", params, state),
+    do: handle_notification("item/reasoning/textDelta", params, state)
+
+  # Some Codex turns split the summary into parts instead of deltas. Normalize
+  # the part into the same event without inventing a second display type.
+  defp handle_notification("item/reasoning/summaryPartAdded", params, state) do
+    delta = params["text"] || params["summary"] || params["part"] || ""
+    handle_notification("item/reasoning/textDelta", Map.put(params, "delta", delta), state)
+  end
+
   # ── Tool Call Notifications ───────────────────────────────────
 
   # Tool call started (item/created with tool call type)
