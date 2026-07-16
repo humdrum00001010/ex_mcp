@@ -98,11 +98,10 @@ defmodule ExMCP.ACP.Adapters.Codex do
   # access mode the LiveView passes down (`approvalPolicy`/`sandbox`).
   defp auto_approve?(opts) do
     policy = opts |> Keyword.get(:approvalPolicy) |> to_string()
-    sandbox = opts |> Keyword.get(:sandbox) |> to_string()
 
-    # "never" approval policy == full-workspace (don't ask). A writable sandbox
-    # (workspace-write / danger-full-access) likewise means writes are intended.
-    policy in ["never"] or sandbox in ["workspace-write", "danger-full-access"]
+    # A writable sandbox is also used by an "ask" rail. Only the explicit
+    # no-approval policy authorizes a host-selected MCP write capability.
+    policy == "never"
   end
 
   @impl true
@@ -523,9 +522,12 @@ defmodule ExMCP.ACP.Adapters.Codex do
   #   item/permissions/requestApproval-> { permissions, scope }  (not auto-handled; declined)
   #   applyPatchApproval / execCommandApproval (legacy v1) -> { decision: ReviewDecision }
   #
-  # When the workspace access mode permits writes we auto-approve so the write
-  # tool (e.g. doc.edit) proceeds; otherwise we decline (the user picked a
-  # read-only / ask mode and we don't have an interactive approval UI wired here).
+  # The embedded host can auto-approve its explicitly configured MCP write
+  # surface (for example a document server that independently confines paths).
+  # Shell/file approval requests are different: they request additional
+  # permissions (for example, a writable root, execution policy, or network
+  # access). Treating the host's `workspace-write` choice as approval silently
+  # expands a document agent's boundary beyond its document workspace.
   defp handle_server_request("mcpServer/elicitation/request", id, params, state) do
     # MCP elicitation: accept with empty structured content (our doc.* tools don't
     # require structured user input — the elicitation is just an approval gate).
@@ -534,7 +536,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
     # `_meta.codex_approval_kind = "mcp_tool_call"`. It blocks the turn until we
     # reply — leaving it unanswered is what stalls doc.edit.
     {action, content} =
-      if state.auto_approve?, do: {"accept", %{}}, else: {"decline", nil}
+      if auto_approve_mcp_server?(state, params), do: {"accept", %{}}, else: {"decline", nil}
 
     Logger.debug(
       "[Codex Adapter] mcpServer/elicitation/request -> #{action} (#{params["serverName"]})"
@@ -546,17 +548,15 @@ defmodule ExMCP.ACP.Adapters.Codex do
 
   defp handle_server_request(method, id, _params, state)
        when method in ["item/fileChange/requestApproval", "item/commandExecution/requestApproval"] do
-    decision = if state.auto_approve?, do: "accept", else: "decline"
-    Logger.debug("[Codex Adapter] #{method} -> #{decision}")
-    {:skip_and_write, jsonrpc_result(id, %{"decision" => decision}), state}
+    Logger.debug("[Codex Adapter] #{method} -> decline (permission escalation denied)")
+    {:skip_and_write, jsonrpc_result(id, %{"decision" => "decline"}), state}
   end
 
   # Legacy v1 approval requests use the `ReviewDecision` enum ("approved"/"denied").
   defp handle_server_request(method, id, _params, state)
        when method in ["applyPatchApproval", "execCommandApproval"] do
-    decision = if state.auto_approve?, do: "approved", else: "denied"
-    Logger.debug("[Codex Adapter] #{method} -> #{decision}")
-    {:skip_and_write, jsonrpc_result(id, %{"decision" => decision}), state}
+    Logger.debug("[Codex Adapter] #{method} -> denied (permission escalation denied)")
+    {:skip_and_write, jsonrpc_result(id, %{"decision" => "denied"}), state}
   end
 
   # Any other server request we don't explicitly model: reply with a JSON-RPC
@@ -573,6 +573,13 @@ defmodule ExMCP.ACP.Adapters.Codex do
     }
 
     {:skip_and_write, [Jason.encode!(error), "\n"], state}
+  end
+
+  defp auto_approve_mcp_server?(state, params) do
+    server_name = params["serverName"]
+
+    state.auto_approve? and
+      server_name in Keyword.get(state.opts, :auto_approve_mcp_servers, [])
   end
 
   defp jsonrpc_result(id, result) do
