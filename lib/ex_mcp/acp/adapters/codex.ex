@@ -659,6 +659,26 @@ defmodule ExMCP.ACP.Adapters.Codex do
     {:messages, [notification], state}
   end
 
+  defp handle_notification(
+         "item/started",
+         %{"item" => %{"type" => "commandExecution"} = item},
+         state
+       ) do
+    command = item["command"]
+
+    notification =
+      session_update(state, %{
+        "sessionUpdate" => "tool_call",
+        "toolCallId" => item["id"] || item["callId"],
+        "title" => command_title(command),
+        "kind" => "execute",
+        "status" => "in_progress",
+        "rawInput" => %{"command" => command}
+      })
+
+    {:messages, [notification], state}
+  end
+
   defp handle_notification("item/started", _params, state) do
     {:skip, state}
   end
@@ -966,6 +986,26 @@ defmodule ExMCP.ACP.Adapters.Codex do
         "rawInput" => item["arguments"],
         "rawOutput" => item["output"] || item["result"],
         "content" => [tool_text_content(item["output"] || item["result"] || "")]
+      })
+
+    {:messages, [notification], state}
+  end
+
+  defp handle_item_completed(%{"type" => "commandExecution"} = item, state) do
+    exit_code = item["exitCode"]
+    output = item["aggregatedOutput"] || item["output"] || ""
+    failed? = item["status"] == "failed" or (is_integer(exit_code) and exit_code != 0)
+
+    notification =
+      session_update(state, %{
+        "sessionUpdate" => "tool_call_update",
+        "toolCallId" => item["id"] || item["callId"],
+        "toolName" => command_title(item["command"]),
+        "kind" => "execute",
+        "status" => if(failed?, do: "failed", else: "completed"),
+        "rawInput" => %{"command" => item["command"]},
+        "rawOutput" => %{"exitCode" => exit_code, "output" => output},
+        "content" => [tool_text_content(output)]
       })
 
     {:messages, [notification], state}
