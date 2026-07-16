@@ -24,8 +24,6 @@ defmodule ExMCP.ACP.AdapterBridge do
 
   use GenServer
 
-  require Logger
-
   @type t :: GenServer.server()
 
   defstruct [
