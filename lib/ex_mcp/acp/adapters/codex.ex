@@ -284,7 +284,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
       |> maybe_put("model", state.model || params["model"])
       |> maybe_put("cwd", params["cwd"] || Keyword.get(state.opts, :cwd))
       |> maybe_put("approvalPolicy", params["approvalPolicy"])
-      |> maybe_put("sandbox", params["sandbox"])
+      |> maybe_put("sandbox", thread_sandbox(params, state))
 
     request = encode_request(id, "thread/start", wire_params)
     state = track_request(state, id, :thread_start, acp_id)
@@ -414,6 +414,16 @@ defmodule ExMCP.ACP.Adapters.Codex do
     {:ok, :skip, state}
   end
 
+  # Codex permission profiles and legacy `sandbox` settings are mutually
+  # exclusive. Embedded hosts that deliberately launch Codex with a custom
+  # profile must keep the old thread/start field absent so the process-level
+  # profile remains authoritative.
+  defp thread_sandbox(params, %{opts: opts}) when is_list(opts) do
+    if Keyword.get(opts, :use_permission_profile, false), do: nil, else: params["sandbox"]
+  end
+
+  defp thread_sandbox(params, _state), do: params["sandbox"]
+
   # ── Inbound: Codex → ACP ─────────────────────────────────────
 
   @impl true
@@ -479,17 +489,23 @@ defmodule ExMCP.ACP.Adapters.Codex do
   end
 
   defp handle_typed_response(:thread_start, %{acp_id: acp_id}, {:ok, result}, state) do
-    thread = result["thread"] || %{}
-    thread_id = thread["id"] || ""
-    state = %{state | thread_id: thread_id}
+    case validate_permission_profile(result, state) do
+      :ok ->
+        thread = result["thread"] || %{}
+        thread_id = thread["id"] || ""
+        state = %{state | thread_id: thread_id}
 
-    response = %{
-      "jsonrpc" => "2.0",
-      "id" => acp_id,
-      "result" => %{"sessionId" => thread_id, "metadata" => thread}
-    }
+        response = %{
+          "jsonrpc" => "2.0",
+          "id" => acp_id,
+          "result" => %{"sessionId" => thread_id, "metadata" => thread}
+        }
 
-    {:messages, [response], state}
+        {:messages, [response], state}
+
+      {:error, error} ->
+        {:messages, [error_response(acp_id, error)], state}
+    end
   end
 
   defp handle_typed_response(:thread_start, %{acp_id: acp_id}, {:error, error}, state) do
@@ -516,6 +532,25 @@ defmodule ExMCP.ACP.Adapters.Codex do
       "id" => acp_id,
       "error" => normalize_error(error)
     }
+  end
+
+  defp validate_permission_profile(result, %{opts: opts}) do
+    expected = Keyword.get(opts, :expected_permission_profile)
+
+    cond do
+      expected in [nil, ""] ->
+        :ok
+
+      get_in(result, ["activePermissionProfile", "id"]) == expected ->
+        :ok
+
+      true ->
+        {:error,
+         %{
+           "code" => -32_002,
+           "message" => "Codex did not activate the required permission profile #{expected}."
+         }}
+    end
   end
 
   # ── Server→Client Request Handling (approvals / elicitations) ──
