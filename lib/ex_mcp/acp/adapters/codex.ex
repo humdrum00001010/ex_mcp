@@ -112,8 +112,24 @@ defmodule ExMCP.ACP.Adapters.Codex do
     # app-server process level (TOML `[mcp_servers.<name>]`), not per thread/start,
     # so they must be injected here at launch.
     mcp_args = mcp_server_config_args(Keyword.get(opts, :mcp_servers))
-    {"codex", ["app-server"] ++ mcp_args}
+    memory_args = memory_config_args(Keyword.get(opts, :disable_memories, false))
+    {"codex", ["app-server"] ++ memory_args ++ mcp_args}
   end
+
+  # ACP hosts can opt out of Codex's personal memory store for an embedded
+  # agent. This is process-local configuration, not a compensating prompt: it
+  # keeps unrelated user memories out of the provider context and prevents the
+  # embedded turn from generating new memories.
+  defp memory_config_args(true) do
+    [
+      "-c",
+      "memories.use_memories=false",
+      "-c",
+      "memories.generate_memories=false"
+    ]
+  end
+
+  defp memory_config_args(_), do: []
 
   # Build `-c key=value` overrides for each MCP server. HTTP (streamable) servers
   # use `mcp_servers.<name>.url`; stdio servers use `.command`/`.args`. We also
