@@ -190,6 +190,7 @@ defmodule ExMCP.ACP.AdapterBridge do
   @impl true
   def terminate(_reason, state) do
     do_close(state)
+    run_termination_hook(state.adapter_opts)
     :ok
   end
 
@@ -694,4 +695,18 @@ defmodule ExMCP.ACP.AdapterBridge do
   end
 
   defp port_env(_env), do: []
+
+  defp run_termination_hook(opts) do
+    case Keyword.get(opts, :on_terminate) do
+      hook when is_function(hook, 0) ->
+        hook.()
+
+      _other ->
+        :ok
+    end
+  rescue
+    _error -> :ok
+  catch
+    _, _ -> :ok
+  end
 end
