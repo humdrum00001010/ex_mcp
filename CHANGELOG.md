@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - fork (humdrum00001010/ex_mcp)
 
 ### Fixed
+- **Codex ACP file activity** — Dynamic `read_text_file`, `search_text_file`, and
+  `edit_text_file` items now surface as dedicated metadata-only
+  `file_operation` / `file_operation_update` session updates. These extensions
+  use the Codex item id (which is distinct from the `item/tool/call` request id),
+  omit file contents and edit fragments, and include only a bounded reason on
+  failure. Read-only shell inspection remains available alongside ACP file tools.
 - **Codex adapter** — `account/rateLimits/updated` notifications are now handled
   instead of falling through the catch-all as "Unhandled" and being dropped. The
   `RateLimitSnapshot` (primary/secondary windows, credits, plan type) is forwarded

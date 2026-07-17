@@ -266,7 +266,8 @@ defmodule ExMCP.ACP.Types do
   #   session_info_update, usage_update, agent_thought_chunk
   #
   # Extension types (not in spec, used by adapters):
-  #   status, usage, error, rpc_response, rpc_error, extension_ui_request
+  #   status, usage, file_operation, file_operation_update, error, rpc_response,
+  #   rpc_error, extension_ui_request
 
   @type session_update_params :: %{
           required(:sessionId) => String.t(),
@@ -285,6 +286,8 @@ defmodule ExMCP.ACP.Types do
           | current_mode_update()
           | session_info_update()
           | usage_update()
+          | file_operation_started_update()
+          | file_operation_update()
           | thinking_update()
           | status_update()
 
@@ -361,6 +364,27 @@ defmodule ExMCP.ACP.Types do
         }
 
   # ── Extension session update types ─────────────────────────────
+
+  @type file_operation_started_update :: %{
+          required(:sessionUpdate) => :file_operation,
+          required(:fileOperationId) => String.t(),
+          required(:operation) => String.t(),
+          required(:kind) => String.t(),
+          required(:path) => String.t(),
+          required(:status) => String.t(),
+          optional(:query) => String.t()
+        }
+
+  @type file_operation_update :: %{
+          required(:sessionUpdate) => :file_operation_update,
+          required(:fileOperationId) => String.t(),
+          required(:operation) => String.t(),
+          required(:kind) => String.t(),
+          required(:path) => String.t(),
+          required(:status) => String.t(),
+          optional(:query) => String.t(),
+          optional(:reason) => String.t()
+        }
 
   @type thinking_update :: %{
           required(:sessionUpdate) => :thinking,

@@ -42,11 +42,14 @@ defmodule ExMCP.Test.FakeCodexFileLane do
     notify("item/started", %{
       "item" => %{
         "id" => "dynamic-item-1",
-        "callId" => "dynamic-call-1",
         "type" => "dynamicToolCall",
+        "namespace" => nil,
         "tool" => "read_text_file",
         "arguments" => %{"path" => "brief.md"},
-        "status" => "inProgress"
+        "status" => "inProgress",
+        "contentItems" => nil,
+        "success" => nil,
+        "durationMs" => nil
       }
     })
 
@@ -54,6 +57,7 @@ defmodule ExMCP.Test.FakeCodexFileLane do
       "threadId" => state.thread_id,
       "turnId" => state.turn_id,
       "callId" => "dynamic-call-1",
+      "namespace" => nil,
       "tool" => "read_text_file",
       "arguments" => %{"path" => "brief.md"}
     })
@@ -65,26 +69,31 @@ defmodule ExMCP.Test.FakeCodexFileLane do
     notify("item/completed", %{
       "item" => %{
         "id" => "dynamic-item-1",
-        "callId" => "dynamic-call-1",
         "type" => "dynamicToolCall",
+        "namespace" => nil,
         "tool" => "read_text_file",
         "arguments" => %{"path" => "brief.md"},
         "status" => "completed",
-        "contentItems" => result["contentItems"]
+        "success" => true,
+        "contentItems" => result["contentItems"],
+        "durationMs" => 1
       }
     })
 
     notify("item/started", %{
       "item" => %{
         "id" => "dynamic-item-2",
-        "callId" => "dynamic-call-2",
         "type" => "dynamicToolCall",
+        "namespace" => nil,
         "tool" => "edit_text_file",
         "arguments" => %{
           "path" => "brief.md",
           "edits" => [%{"old_text" => "brokered", "new_text" => "edited"}]
         },
-        "status" => "inProgress"
+        "status" => "inProgress",
+        "contentItems" => nil,
+        "success" => nil,
+        "durationMs" => nil
       }
     })
 
@@ -92,6 +101,7 @@ defmodule ExMCP.Test.FakeCodexFileLane do
       "threadId" => state.thread_id,
       "turnId" => state.turn_id,
       "callId" => "dynamic-call-2",
+      "namespace" => nil,
       "tool" => "edit_text_file",
       "arguments" => %{
         "path" => "brief.md",
@@ -106,15 +116,17 @@ defmodule ExMCP.Test.FakeCodexFileLane do
     notify("item/completed", %{
       "item" => %{
         "id" => "dynamic-item-2",
-        "callId" => "dynamic-call-2",
         "type" => "dynamicToolCall",
+        "namespace" => nil,
         "tool" => "edit_text_file",
         "arguments" => %{
           "path" => "brief.md",
           "edits" => [%{"old_text" => "brokered", "new_text" => "edited"}]
         },
         "status" => "completed",
-        "contentItems" => result["contentItems"]
+        "success" => true,
+        "contentItems" => result["contentItems"],
+        "durationMs" => 1
       }
     })
 

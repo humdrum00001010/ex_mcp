@@ -25,6 +25,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
   | `session/cancel` | `turn/interrupt` request |
   | `item/agentMessage/delta` | `session/update` (text) |
   | `item/reasoning/textDelta` | `session/update` (`agent_thought_chunk`) |
+  | `item/*` (ACP file operation) | `session/update` (`file_operation` / `file_operation_update`) |
   | `item/completed` (tool) | `session/update` (`tool_call_update`) |
   | `item/commandExecution/*` | `session/update` (`tool_call` / `tool_call_update`) |
   | `turn/completed` | prompt response result |
@@ -60,6 +61,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
   # Seconds an individual MCP tool call may run before codex aborts it; doc.edit
   # on a large document can be slow, so give it room.
   @mcp_tool_timeout_sec 120
+  @max_file_operation_reason_chars 500
 
   defstruct [
     :model,
@@ -70,7 +72,6 @@ defmodule ExMCP.ACP.Adapters.Codex do
     phase: :initializing,
     pending_requests: %{},
     pending_client_requests: %{},
-    file_lane_call_ids: MapSet.new(),
     client_capabilities: %{},
     accumulated_text: [],
     accumulated_thinking: [],
@@ -371,7 +372,6 @@ defmodule ExMCP.ACP.Adapters.Codex do
         |> Map.put(:accumulated_text, [])
         |> Map.put(:accumulated_thinking, [])
         |> Map.put(:accumulated_usage, nil)
-        |> Map.put(:file_lane_call_ids, MapSet.new())
 
       {:ok, request, state}
     else
@@ -386,7 +386,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
     # ACP file replies can race cancellation. Drop their correlations before
     # interrupting the turn so a late host response can never complete a tool
     # call that Codex has already abandoned.
-    state = %{state | pending_client_requests: %{}, file_lane_call_ids: MapSet.new()}
+    state = %{state | pending_client_requests: %{}}
     thread_id = params["sessionId"] || state.thread_id
     turn_id = params["turnId"] || state.turn_id
 
@@ -557,7 +557,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
   end
 
   defp handle_typed_response(:turn_interrupt, _entry, _reply, state) do
-    {:skip, %{state | pending_client_requests: %{}, file_lane_call_ids: MapSet.new()}}
+    {:skip, %{state | pending_client_requests: %{}}}
   end
 
   defp error_response(acp_id, error) do
@@ -653,9 +653,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
          ) do
       {:ok, request, pending} ->
         state =
-          state
-          |> put_pending_client_request(request["id"], pending)
-          |> remember_file_lane_call(params)
+          put_pending_client_request(state, request["id"], pending)
 
         {:messages, [request], state}
 
@@ -820,7 +818,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
          state
        ) do
     if FileLane.tool_name?(item["tool"] || item["name"]) do
-      {:skip, remember_file_lane_call(state, item)}
+      {:messages, [file_operation_started_update(state, item)], state}
     else
       notification =
         session_update(state, %{
@@ -996,7 +994,6 @@ defmodule ExMCP.ACP.Adapters.Codex do
         accumulated_thinking: [],
         accumulated_usage: nil,
         pending_client_requests: %{},
-        file_lane_call_ids: MapSet.new(),
         turn_id: nil,
         current_prompt_acp_id: nil
     }
@@ -1171,8 +1168,12 @@ defmodule ExMCP.ACP.Adapters.Codex do
   end
 
   defp handle_item_completed(%{"type" => "dynamicToolCall"} = item, state) do
-    if file_lane_call?(state, item) do
-      {:skip, forget_file_lane_call(state, item)}
+    # A DynamicToolCallThreadItem is identified by `item.id`. The separate
+    # `item/tool/call` server request carries a `params.callId`; that id only
+    # correlates the JSON-RPC request/response and must not replace the item id.
+    if FileLane.tool_name?(item["tool"] || item["name"]) do
+      notification = file_operation_completed_update(state, item)
+      {:messages, [notification], state}
     else
       failed? = item["status"] == "failed" or item["error"] != nil
       output = dynamic_item_output(item)
@@ -1326,26 +1327,80 @@ defmodule ExMCP.ACP.Adapters.Codex do
     end
   end
 
-  defp file_lane_call?(state, item) do
-    FileLane.tool_name?(item["tool"] || item["name"]) or
-      MapSet.member?(state.file_lane_call_ids, dynamic_tool_call_id(item))
+  defp file_operation_started_update(state, item) do
+    session_update(state, file_operation_update(item, "file_operation", "in_progress"))
   end
 
-  defp remember_file_lane_call(state, item) do
-    case dynamic_tool_call_id(item) do
-      nil -> state
-      call_id -> %{state | file_lane_call_ids: MapSet.put(state.file_lane_call_ids, call_id)}
+  defp file_operation_completed_update(state, item) do
+    failed? =
+      item["status"] == "failed" or item["success"] == false or item["error"] != nil
+
+    status = if(failed?, do: "failed", else: "completed")
+
+    update = file_operation_update(item, "file_operation_update", status)
+
+    update =
+      if failed? do
+        Map.put(update, "reason", file_operation_failure_reason(item))
+      else
+        update
+      end
+
+    session_update(state, update)
+  end
+
+  defp file_operation_update(item, update_kind, status) do
+    operation = item["tool"] || item["name"]
+    arguments = if is_map(item["arguments"]), do: item["arguments"], else: %{}
+
+    %{
+      "sessionUpdate" => update_kind,
+      "fileOperationId" => item["id"],
+      "operation" => operation,
+      "kind" => codex_tool_kind(operation),
+      "path" => arguments["path"],
+      "status" => status
+    }
+    |> maybe_put("query", arguments["query"])
+  end
+
+  defp file_operation_failure_reason(item) do
+    item
+    |> file_operation_failure_text()
+    |> normalize_file_operation_reason()
+  end
+
+  defp file_operation_failure_text(%{"error" => %{"message" => message}})
+       when is_binary(message),
+       do: message
+
+  defp file_operation_failure_text(%{"error" => error}) when is_binary(error), do: error
+
+  defp file_operation_failure_text(%{"output" => output}) when is_binary(output), do: output
+
+  defp file_operation_failure_text(%{"contentItems" => items}) when is_list(items) do
+    Enum.find_value(items, "File operation failed.", fn
+      %{"text" => text} when is_binary(text) and text != "" -> text
+      _ -> nil
+    end)
+  end
+
+  defp file_operation_failure_text(_item), do: "File operation failed."
+
+  defp normalize_file_operation_reason(text) do
+    normalized =
+      text
+      |> String.replace(~r/\s+/u, " ")
+      |> String.trim()
+
+    normalized = if normalized == "", do: "File operation failed.", else: normalized
+
+    if String.length(normalized) > @max_file_operation_reason_chars do
+      String.slice(normalized, 0, @max_file_operation_reason_chars - 1) <> "…"
+    else
+      normalized
     end
   end
-
-  defp forget_file_lane_call(state, item) do
-    case dynamic_tool_call_id(item) do
-      nil -> state
-      call_id -> %{state | file_lane_call_ids: MapSet.delete(state.file_lane_call_ids, call_id)}
-    end
-  end
-
-  defp dynamic_tool_call_id(item), do: item["callId"] || item["id"]
 
   defp command_title(command) when is_binary(command) and command != "", do: command
   defp command_title(_), do: "Run Command"

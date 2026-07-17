@@ -33,6 +33,29 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
     assert names == ["read_text_file", "search_text_file", "edit_text_file"]
   end
 
+  test "ACP file tool descriptions do not prohibit shell search" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true, "writeTextFile" => true}})
+
+    assert {:ok, request, _state} =
+             Codex.translate_outbound(
+               %{
+                 "method" => "session/new",
+                 "id" => 1,
+                 "params" => %{"cwd" => "/workspace"}
+               },
+               state
+             )
+
+    descriptions =
+      request
+      |> decode()
+      |> get_in(["params", "dynamicTools"])
+      |> Enum.map_join(" ", & &1["description"])
+
+    refute descriptions =~ "Never use shell"
+    refute descriptions =~ "instead of rg"
+  end
+
   test "read_text_file round-trips through ACP fs/read_text_file" do
     state = initialized_state(%{"fs" => %{"readTextFile" => true}})
 
@@ -43,6 +66,9 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
                  "method" => "item/tool/call",
                  "params" => %{
                    "threadId" => "thread-1",
+                   "turnId" => "turn-1",
+                   "callId" => "dynamic-call-41",
+                   "namespace" => nil,
                    "tool" => "read_text_file",
                    "arguments" => %{"path" => "brief.md", "line" => 4, "limit" => 8}
                  }
@@ -239,60 +265,181 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
     assert result =~ "More literal matches exist"
   end
 
-  test "ACP file lane dynamic notifications stay internal across start and completion" do
+  test "ACP file lane dynamic notifications emit metadata-only file activity using item ids" do
     state = initialized_state(%{"fs" => %{"readTextFile" => true, "writeTextFile" => true}})
+
+    operations = [
+      {"read_text_file", "read", %{"path" => "contract.jsonl", "max_chars" => 200_000}},
+      {"search_text_file", "search",
+       %{"path" => "contract.jsonl", "query" => "(인)", "max_results" => 5}},
+      {"edit_text_file", "edit",
+       %{
+         "path" => "contract.jsonl",
+         "edits" => [%{"old_text" => "private old content", "new_text" => "private new content"}]
+       }}
+    ]
 
     final_state =
       Enum.reduce(
-        ["read_text_file", "search_text_file", "edit_text_file"],
+        operations,
         state,
-        fn tool, current_state ->
-          call_id = "#{tool}-call"
+        fn {tool, kind, arguments}, current_state ->
+          item_id = "#{tool}-item"
 
           started = %{
-            "id" => "#{tool}-item",
-            "callId" => call_id,
+            "id" => item_id,
             "type" => "dynamicToolCall",
+            "namespace" => nil,
             "tool" => tool,
-            "arguments" => %{"path" => "contract.jsonl"},
-            "status" => "inProgress"
+            "arguments" => arguments,
+            "status" => "inProgress",
+            "contentItems" => nil,
+            "success" => nil,
+            "durationMs" => nil
           }
 
-          assert {:skip, started_state} =
+          assert {:messages, [started_message], started_state} =
                    item_notification(current_state, "item/started", started)
 
+          assert %{
+                   "sessionUpdate" => "file_operation",
+                   "fileOperationId" => ^item_id,
+                   "operation" => ^tool,
+                   "kind" => ^kind,
+                   "path" => "contract.jsonl",
+                   "status" => "in_progress"
+                 } = started_update = get_in(started_message, ["params", "update"])
+
+          assert Map.keys(started_update) |> Enum.sort() ==
+                   expected_file_operation_keys(tool, false)
+
           completed = %{
-            "id" => "#{tool}-item",
-            "callId" => call_id,
+            "id" => item_id,
             "type" => "dynamicToolCall",
+            "namespace" => nil,
+            "tool" => tool,
+            "arguments" => arguments,
             "status" => "completed",
-            "contentItems" => [%{"type" => "inputText", "text" => "done"}]
+            "success" => true,
+            "contentItems" => [%{"type" => "inputText", "text" => "done"}],
+            "durationMs" => 1
           }
 
-          assert {:skip, completed_state} =
+          assert {:messages, [completed_message], completed_state} =
                    item_notification(started_state, "item/completed", completed)
+
+          assert %{
+                   "sessionUpdate" => "file_operation_update",
+                   "fileOperationId" => ^item_id,
+                   "operation" => ^tool,
+                   "kind" => ^kind,
+                   "path" => "contract.jsonl",
+                   "status" => "completed"
+                 } = completed_update = get_in(completed_message, ["params", "update"])
+
+          assert Map.keys(completed_update) |> Enum.sort() ==
+                   expected_file_operation_keys(tool, false)
 
           completed_state
         end
       )
 
-    assert final_state.file_lane_call_ids == MapSet.new()
+    refute Map.has_key?(final_state, :file_lane_call_ids)
+    refute Map.has_key?(final_state, :file_lane_calls)
   end
 
-  test "ACP file lane failure completion stays internal even without a start notification" do
+  test "item/tool/call request ids never replace Codex dynamic item ids" do
     state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+
+    item = %{
+      "id" => "dynamic-item-9",
+      "type" => "dynamicToolCall",
+      "namespace" => nil,
+      "tool" => "read_text_file",
+      "arguments" => %{"path" => "contract.jsonl"},
+      "status" => "inProgress",
+      "contentItems" => nil,
+      "success" => nil,
+      "durationMs" => nil
+    }
+
+    assert {:messages, [started_message], state} =
+             item_notification(state, "item/started", item)
+
+    assert get_in(started_message, ["params", "update", "fileOperationId"]) ==
+             "dynamic-item-9"
+
+    assert {:messages, [_fs_request], state} =
+             Codex.translate_inbound(
+               Jason.encode!(%{
+                 "id" => 700,
+                 "method" => "item/tool/call",
+                 "params" => %{
+                   "threadId" => "thread-1",
+                   "turnId" => "turn-1",
+                   "callId" => "dynamic-call-9",
+                   "namespace" => nil,
+                   "tool" => "read_text_file",
+                   "arguments" => %{"path" => "contract.jsonl", "max_chars" => 500_000}
+                 }
+               }),
+               state
+             )
+
+    completed =
+      Map.merge(item, %{
+        "status" => "completed",
+        "success" => true,
+        "contentItems" => [%{"type" => "inputText", "text" => "done"}],
+        "durationMs" => 1
+      })
+
+    assert {:messages, [completed_message], _state} =
+             item_notification(state, "item/completed", completed)
+
+    update = get_in(completed_message, ["params", "update"])
+    assert update["fileOperationId"] == "dynamic-item-9"
+    refute Map.has_key?(update, "callId")
+    refute Map.has_key?(update, "rawInput")
+    refute Map.has_key?(update, "rawOutput")
+  end
+
+  test "success false fails a file operation with a clean bounded reason" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+    long_reason = "  host\nread failed  " <> String.duplicate("x", 1_000)
 
     failed = %{
       "id" => "file-failed-item",
-      "callId" => "file-failed-call",
       "type" => "dynamicToolCall",
+      "namespace" => nil,
       "tool" => "search_text_file",
       "arguments" => %{"path" => "contract.jsonl", "query" => "(인)"},
-      "status" => "failed",
-      "error" => %{"message" => "host read failed"}
+      "status" => "completed",
+      "success" => false,
+      "contentItems" => [%{"type" => "inputText", "text" => long_reason}],
+      "durationMs" => 1
     }
 
-    assert {:skip, _state} = item_notification(state, "item/completed", failed)
+    assert {:messages, [message], _state} = item_notification(state, "item/completed", failed)
+
+    assert %{
+             "sessionUpdate" => "file_operation_update",
+             "fileOperationId" => "file-failed-item",
+             "operation" => "search_text_file",
+             "kind" => "search",
+             "path" => "contract.jsonl",
+             "query" => "(인)",
+             "status" => "failed",
+             "reason" => reason
+           } = update = get_in(message, ["params", "update"])
+
+    assert String.starts_with?(reason, "host read failed x")
+    assert String.ends_with?(reason, "…")
+    assert String.length(reason) == 500
+    refute reason =~ "\n"
+
+    assert Map.keys(update) |> Enum.sort() ==
+             expected_file_operation_keys("search_text_file", true)
   end
 
   test "ordinary dynamic tool notifications still emit ACP tool updates" do
@@ -300,11 +447,14 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
 
     started = %{
       "id" => "ordinary-item",
-      "callId" => "ordinary-call",
       "type" => "dynamicToolCall",
+      "namespace" => nil,
       "tool" => "custom_lookup",
       "arguments" => %{"query" => "contract"},
-      "status" => "inProgress"
+      "status" => "inProgress",
+      "contentItems" => nil,
+      "success" => nil,
+      "durationMs" => nil
     }
 
     assert {:messages, [started_message], state} =
@@ -312,7 +462,7 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
 
     assert %{
              "sessionUpdate" => "tool_call",
-             "toolCallId" => "ordinary-call",
+             "toolCallId" => "ordinary-item",
              "title" => "custom_lookup"
            } = get_in(started_message, ["params", "update"])
 
@@ -326,7 +476,7 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
 
     assert %{
              "sessionUpdate" => "tool_call_update",
-             "toolCallId" => "ordinary-call",
+             "toolCallId" => "ordinary-item",
              "toolName" => "custom_lookup",
              "status" => "failed"
            } = get_in(failed_message, ["params", "update"])
@@ -538,7 +688,14 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
       Jason.encode!(%{
         "id" => id,
         "method" => "item/tool/call",
-        "params" => %{"threadId" => "thread-1", "tool" => tool, "arguments" => arguments}
+        "params" => %{
+          "threadId" => "thread-1",
+          "turnId" => "turn-1",
+          "callId" => "dynamic-call-#{id}",
+          "namespace" => nil,
+          "tool" => tool,
+          "arguments" => arguments
+        }
       }),
       state
     )
@@ -549,6 +706,15 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
       Jason.encode!(%{"method" => method, "params" => %{"item" => item}}),
       state
     )
+  end
+
+  defp expected_file_operation_keys(operation, failed?) do
+    keys =
+      ~w(fileOperationId kind operation path sessionUpdate status) ++
+        if(operation == "search_text_file", do: ["query"], else: []) ++
+        if(failed?, do: ["reason"], else: [])
+
+    Enum.sort(keys)
   end
 
   defp decode(iodata), do: iodata |> IO.iodata_to_binary() |> Jason.decode!()

@@ -173,7 +173,7 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
       "type" => "function",
       "name" => "read_text_file",
       "description" =>
-        "Read a workspace text file through the host ACP client. Use offset/max_chars to page through compact one-line JSONL; line/limit are for ordinary multiline text. Never use shell commands.",
+        "Read a workspace text file through the host ACP client. Use offset/max_chars to page through compact one-line JSONL; line/limit are for ordinary multiline text.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -194,7 +194,7 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
       "type" => "function",
       "name" => "search_text_file",
       "description" =>
-        "Search one text file through ACP and return bounded literal occurrences with surrounding context. Use this instead of rg, grep, jq, or document extractors.",
+        "Search one text file through ACP and return bounded literal occurrences with surrounding context.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
