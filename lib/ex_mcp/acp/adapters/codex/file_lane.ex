@@ -2,6 +2,10 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
   @moduledoc false
 
   @max_edits 100
+  @tool_names ~w(read_text_file search_text_file edit_text_file)
+
+  @doc false
+  def tool_name?(name), do: name in @tool_names
 
   def tools(capabilities) do
     if capability?(capabilities, "readTextFile") do

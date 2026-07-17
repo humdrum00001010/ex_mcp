@@ -5,7 +5,10 @@ defmodule ExMCP.Test.CodexFileLaneHandler do
   def init(opts), do: {:ok, %{test_pid: Keyword.fetch!(opts, :test_pid)}}
 
   @impl true
-  def handle_session_update(_session_id, _update, state), do: {:ok, state}
+  def handle_session_update(session_id, update, state) do
+    send(state.test_pid, {:fake_session_update, session_id, update})
+    {:ok, state}
+  end
 
   @impl true
   def handle_permission_request(_session_id, _tool_call, _options, state) do

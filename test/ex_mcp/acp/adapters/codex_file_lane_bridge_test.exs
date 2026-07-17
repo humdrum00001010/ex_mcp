@@ -41,5 +41,9 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneBridgeTest do
                    5_000
 
     assert {:ok, %{"stopReason" => "end_turn"}} = Task.await(task, 5_000)
+
+    refute_received {:fake_session_update, ^session_id, %{"sessionUpdate" => "tool_call"}}
+
+    refute_received {:fake_session_update, ^session_id, %{"sessionUpdate" => "tool_call_update"}}
   end
 end

@@ -70,6 +70,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
     phase: :initializing,
     pending_requests: %{},
     pending_client_requests: %{},
+    file_lane_call_ids: MapSet.new(),
     client_capabilities: %{},
     accumulated_text: [],
     accumulated_thinking: [],
@@ -370,6 +371,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
         |> Map.put(:accumulated_text, [])
         |> Map.put(:accumulated_thinking, [])
         |> Map.put(:accumulated_usage, nil)
+        |> Map.put(:file_lane_call_ids, MapSet.new())
 
       {:ok, request, state}
     else
@@ -384,7 +386,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
     # ACP file replies can race cancellation. Drop their correlations before
     # interrupting the turn so a late host response can never complete a tool
     # call that Codex has already abandoned.
-    state = %{state | pending_client_requests: %{}}
+    state = %{state | pending_client_requests: %{}, file_lane_call_ids: MapSet.new()}
     thread_id = params["sessionId"] || state.thread_id
     turn_id = params["turnId"] || state.turn_id
 
@@ -555,7 +557,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
   end
 
   defp handle_typed_response(:turn_interrupt, _entry, _reply, state) do
-    {:skip, %{state | pending_client_requests: %{}}}
+    {:skip, %{state | pending_client_requests: %{}, file_lane_call_ids: MapSet.new()}}
   end
 
   defp error_response(acp_id, error) do
@@ -650,7 +652,11 @@ defmodule ExMCP.ACP.Adapters.Codex do
            state.pending_client_requests
          ) do
       {:ok, request, pending} ->
-        state = put_pending_client_request(state, request["id"], pending)
+        state =
+          state
+          |> put_pending_client_request(request["id"], pending)
+          |> remember_file_lane_call(params)
+
         {:messages, [request], state}
 
       {:error, reason} ->
@@ -813,17 +819,21 @@ defmodule ExMCP.ACP.Adapters.Codex do
          %{"item" => %{"type" => "dynamicToolCall"} = item},
          state
        ) do
-    notification =
-      session_update(state, %{
-        "sessionUpdate" => "tool_call",
-        "toolCallId" => item["callId"] || item["id"],
-        "title" => item["tool"],
-        "kind" => codex_tool_kind(item["tool"]),
-        "rawInput" => item["arguments"],
-        "status" => "in_progress"
-      })
+    if FileLane.tool_name?(item["tool"] || item["name"]) do
+      {:skip, remember_file_lane_call(state, item)}
+    else
+      notification =
+        session_update(state, %{
+          "sessionUpdate" => "tool_call",
+          "toolCallId" => item["callId"] || item["id"],
+          "title" => item["tool"],
+          "kind" => codex_tool_kind(item["tool"]),
+          "rawInput" => item["arguments"],
+          "status" => "in_progress"
+        })
 
-    {:messages, [notification], state}
+      {:messages, [notification], state}
+    end
   end
 
   defp handle_notification(
@@ -986,6 +996,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
         accumulated_thinking: [],
         accumulated_usage: nil,
         pending_client_requests: %{},
+        file_lane_call_ids: MapSet.new(),
         turn_id: nil,
         current_prompt_acp_id: nil
     }
@@ -1160,22 +1171,26 @@ defmodule ExMCP.ACP.Adapters.Codex do
   end
 
   defp handle_item_completed(%{"type" => "dynamicToolCall"} = item, state) do
-    failed? = item["status"] == "failed" or item["error"] != nil
-    output = dynamic_item_output(item)
+    if file_lane_call?(state, item) do
+      {:skip, forget_file_lane_call(state, item)}
+    else
+      failed? = item["status"] == "failed" or item["error"] != nil
+      output = dynamic_item_output(item)
 
-    notification =
-      session_update(state, %{
-        "sessionUpdate" => "tool_call_update",
-        "toolCallId" => item["callId"] || item["id"],
-        "toolName" => item["tool"],
-        "status" => if(failed?, do: "failed", else: "completed"),
-        "kind" => codex_tool_kind(item["tool"]),
-        "rawInput" => item["arguments"],
-        "rawOutput" => item["output"] || item["contentItems"] || item["error"],
-        "content" => [tool_text_content(output)]
-      })
+      notification =
+        session_update(state, %{
+          "sessionUpdate" => "tool_call_update",
+          "toolCallId" => item["callId"] || item["id"],
+          "toolName" => item["tool"],
+          "status" => if(failed?, do: "failed", else: "completed"),
+          "kind" => codex_tool_kind(item["tool"]),
+          "rawInput" => item["arguments"],
+          "rawOutput" => item["output"] || item["contentItems"] || item["error"],
+          "content" => [tool_text_content(output)]
+        })
 
-    {:messages, [notification], state}
+      {:messages, [notification], state}
+    end
   end
 
   defp handle_item_completed(%{"type" => "commandExecution"} = item, state) do
@@ -1310,6 +1325,27 @@ defmodule ExMCP.ACP.Adapters.Codex do
         Jason.encode!(value)
     end
   end
+
+  defp file_lane_call?(state, item) do
+    FileLane.tool_name?(item["tool"] || item["name"]) or
+      MapSet.member?(state.file_lane_call_ids, dynamic_tool_call_id(item))
+  end
+
+  defp remember_file_lane_call(state, item) do
+    case dynamic_tool_call_id(item) do
+      nil -> state
+      call_id -> %{state | file_lane_call_ids: MapSet.put(state.file_lane_call_ids, call_id)}
+    end
+  end
+
+  defp forget_file_lane_call(state, item) do
+    case dynamic_tool_call_id(item) do
+      nil -> state
+      call_id -> %{state | file_lane_call_ids: MapSet.delete(state.file_lane_call_ids, call_id)}
+    end
+  end
+
+  defp dynamic_tool_call_id(item), do: item["callId"] || item["id"]
 
   defp command_title(command) when is_binary(command) and command != "", do: command
   defp command_title(_), do: "Run Command"

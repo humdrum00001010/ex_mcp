@@ -239,6 +239,136 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
     assert result =~ "More literal matches exist"
   end
 
+  test "ACP file lane dynamic notifications stay internal across start and completion" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true, "writeTextFile" => true}})
+
+    final_state =
+      Enum.reduce(
+        ["read_text_file", "search_text_file", "edit_text_file"],
+        state,
+        fn tool, current_state ->
+          call_id = "#{tool}-call"
+
+          started = %{
+            "id" => "#{tool}-item",
+            "callId" => call_id,
+            "type" => "dynamicToolCall",
+            "tool" => tool,
+            "arguments" => %{"path" => "contract.jsonl"},
+            "status" => "inProgress"
+          }
+
+          assert {:skip, started_state} =
+                   item_notification(current_state, "item/started", started)
+
+          completed = %{
+            "id" => "#{tool}-item",
+            "callId" => call_id,
+            "type" => "dynamicToolCall",
+            "status" => "completed",
+            "contentItems" => [%{"type" => "inputText", "text" => "done"}]
+          }
+
+          assert {:skip, completed_state} =
+                   item_notification(started_state, "item/completed", completed)
+
+          completed_state
+        end
+      )
+
+    assert final_state.file_lane_call_ids == MapSet.new()
+  end
+
+  test "ACP file lane failure completion stays internal even without a start notification" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+
+    failed = %{
+      "id" => "file-failed-item",
+      "callId" => "file-failed-call",
+      "type" => "dynamicToolCall",
+      "tool" => "search_text_file",
+      "arguments" => %{"path" => "contract.jsonl", "query" => "(인)"},
+      "status" => "failed",
+      "error" => %{"message" => "host read failed"}
+    }
+
+    assert {:skip, _state} = item_notification(state, "item/completed", failed)
+  end
+
+  test "ordinary dynamic tool notifications still emit ACP tool updates" do
+    state = initialized_state(%{})
+
+    started = %{
+      "id" => "ordinary-item",
+      "callId" => "ordinary-call",
+      "type" => "dynamicToolCall",
+      "tool" => "custom_lookup",
+      "arguments" => %{"query" => "contract"},
+      "status" => "inProgress"
+    }
+
+    assert {:messages, [started_message], state} =
+             item_notification(state, "item/started", started)
+
+    assert %{
+             "sessionUpdate" => "tool_call",
+             "toolCallId" => "ordinary-call",
+             "title" => "custom_lookup"
+           } = get_in(started_message, ["params", "update"])
+
+    failed =
+      started
+      |> Map.put("status", "failed")
+      |> Map.put("error", %{"message" => "lookup failed"})
+
+    assert {:messages, [failed_message], _state} =
+             item_notification(state, "item/completed", failed)
+
+    assert %{
+             "sessionUpdate" => "tool_call_update",
+             "toolCallId" => "ordinary-call",
+             "toolName" => "custom_lookup",
+             "status" => "failed"
+           } = get_in(failed_message, ["params", "update"])
+  end
+
+  test "MCP tool notifications remain visible when their tool name resembles a file operation" do
+    state = initialized_state(%{})
+
+    started = %{
+      "id" => "mcp-item",
+      "type" => "mcpToolCall",
+      "server" => "doc",
+      "tool" => "read_text_file",
+      "arguments" => %{"path" => "contract.jsonl"},
+      "status" => "inProgress"
+    }
+
+    assert {:messages, [started_message], state} =
+             item_notification(state, "item/started", started)
+
+    assert %{
+             "sessionUpdate" => "tool_call",
+             "toolCallId" => "mcp-item",
+             "title" => "read_text_file"
+           } = get_in(started_message, ["params", "update"])
+
+    completed =
+      started
+      |> Map.put("status", "completed")
+      |> Map.put("result", %{"Ok" => %{"content" => [%{"text" => "done"}]}})
+
+    assert {:messages, [completed_message], _state} =
+             item_notification(state, "item/completed", completed)
+
+    assert %{
+             "sessionUpdate" => "tool_call_update",
+             "toolCallId" => "mcp-item",
+             "toolName" => "read_text_file",
+             "status" => "completed"
+           } = get_in(completed_message, ["params", "update"])
+  end
+
   test "edit_text_file performs exact replacements between ACP read and host write" do
     state =
       initialized_state(%{"fs" => %{"readTextFile" => true, "writeTextFile" => true}})
@@ -410,6 +540,13 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
         "method" => "item/tool/call",
         "params" => %{"threadId" => "thread-1", "tool" => tool, "arguments" => arguments}
       }),
+      state
+    )
+  end
+
+  defp item_notification(state, method, item) do
+    Codex.translate_inbound(
+      Jason.encode!(%{"method" => method, "params" => %{"item" => item}}),
       state
     )
   end
