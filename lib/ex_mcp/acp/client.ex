@@ -786,10 +786,13 @@ defmodule ExMCP.ACP.Client do
     session_id = params["sessionId"]
     path = params["path"]
     content = params["content"]
+    opts = Map.drop(params, ["sessionId", "path", "content"])
 
-    if state.handler_pid && function_exported?(state.handler_mod, :handle_file_write, 4) do
+    if state.handler_pid &&
+         (function_exported?(state.handler_mod, :handle_file_write, 5) or
+            function_exported?(state.handler_mod, :handle_file_write, 4)) do
       ref = make_ref()
-      HandlerRunner.file_write(state.handler_pid, ref, session_id, path, content)
+      HandlerRunner.file_write(state.handler_pid, ref, session_id, path, content, opts)
       track_agent_request(state, ref, :file_write, id, session_id)
     else
       response = Protocol.encode_error(-32601, "File write not supported", nil, id)

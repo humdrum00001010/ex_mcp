@@ -353,6 +353,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         _ = write_to_port(state, data)
         state = synthesize_result(state, id, %{})
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -368,6 +371,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         _ = write_to_port(state, data)
         state = synthesize_result(state, id, %{})
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -383,6 +389,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         state = synthesize_init_response(state, id)
         _ = write_to_port(state, data)
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -405,6 +414,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         state = %{state | adapter_state: new_adapter_state}
         _ = write_to_port(state, data)
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -424,6 +436,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         state = %{state | adapter_state: new_adapter_state}
         _ = write_to_port(state, data)
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -443,6 +458,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         state = %{state | adapter_state: new_adapter_state}
         _ = write_to_port(state, data)
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -458,6 +476,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         _ = write_to_port(state, data)
         state = synthesize_result(state, id, %{})
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -482,6 +503,9 @@ defmodule ExMCP.ACP.AdapterBridge do
           state = %{state | adapter_state: new_adapter_state}
           _ = write_to_port(state, data)
           {:reply, :ok, state}
+
+        {:messages, messages, new_adapter_state} ->
+          {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
       end
     end
   end
@@ -506,6 +530,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         # Synthesize result since native agent won't send ACP response
         state = synthesize_result(state, id, %{})
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -526,6 +553,9 @@ defmodule ExMCP.ACP.AdapterBridge do
         _ = write_to_port(state, data)
         state = synthesize_result(state, id, config_options_result(state))
         {:reply, :ok, state}
+
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
     end
   end
 
@@ -545,6 +575,9 @@ defmodule ExMCP.ACP.AdapterBridge do
             {:reply, {:error, reason}, state}
         end
 
+      {:messages, messages, new_adapter_state} ->
+        {:reply, :ok, push_adapter_messages(state, messages, new_adapter_state)}
+
       {:one_shot, cmd_fn, new_adapter_state} ->
         # One-shot adapters run a subprocess and collect output
         state = %{state | adapter_state: new_adapter_state}
@@ -562,6 +595,11 @@ defmodule ExMCP.ACP.AdapterBridge do
 
         {:reply, :ok, state}
     end
+  end
+
+  defp push_adapter_messages(state, messages, new_adapter_state) do
+    state = %{state | adapter_state: new_adapter_state}
+    push_messages(state, Enum.map(messages, &Jason.encode!/1))
   end
 
   defp write_to_port(%{port: nil}, _data), do: {:error, :no_port}

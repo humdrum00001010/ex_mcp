@@ -59,6 +59,19 @@ defmodule ExMCP.ACP.Client.Handler do
             ) :: {:ok, state()} | {:error, reason :: String.t(), state()}
 
   @doc """
+  Extended file-write callback for ACP agents that attach conditional-write
+  metadata. Implementations may use `opts` for compare-and-swap semantics while
+  existing four-argument handlers remain supported.
+  """
+  @callback handle_file_write(
+              session_id :: String.t(),
+              path :: String.t(),
+              content :: String.t(),
+              opts :: map(),
+              state()
+            ) :: {:ok, state()} | {:error, reason :: String.t(), state()}
+
+  @doc """
   Called when the agent requests a terminal operation.
 
   The `method` is one of the stable `terminal/*` methods and `params` is the
@@ -78,6 +91,7 @@ defmodule ExMCP.ACP.Client.Handler do
   @optional_callbacks [
     handle_file_read: 4,
     handle_file_write: 4,
+    handle_file_write: 5,
     handle_terminal_request: 4,
     terminate: 2
   ]

@@ -43,10 +43,14 @@ defmodule ExMCP.ACP.Adapter do
 
   Returns `{:ok, iodata, new_state}` to write data to stdin,
   or `{:ok, :skip, new_state}` when no output is needed (e.g., initialize
-  is handled internally by the bridge).
+  is handled internally by the bridge). `{:messages, maps, new_state}` queues
+  adapter-originated ACP messages back to the client; the bridge accepts this
+  result for every outbound method.
   """
   @callback translate_outbound(acp_message :: map(), state()) ::
-              {:ok, iodata(), state()} | {:ok, :skip, state()}
+              {:ok, iodata(), state()}
+              | {:ok, :skip, state()}
+              | {:messages, messages :: [map()], state()}
 
   @doc """
   Translate one line of native CLI output to zero or more ACP messages.

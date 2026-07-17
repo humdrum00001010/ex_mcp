@@ -49,6 +49,8 @@ defmodule ExMCP.ACP.Adapters.Codex do
 
   @behaviour ExMCP.ACP.Adapter
 
+  alias ExMCP.ACP.Adapters.Codex.FileLane
+
   require Logger
 
   # Seconds codex waits for an MCP server to finish its initial connect +
@@ -67,6 +69,8 @@ defmodule ExMCP.ACP.Adapters.Codex do
     next_id: 1,
     phase: :initializing,
     pending_requests: %{},
+    pending_client_requests: %{},
+    client_capabilities: %{},
     accumulated_text: [],
     accumulated_thinking: [],
     accumulated_usage: nil,
@@ -276,9 +280,10 @@ defmodule ExMCP.ACP.Adapters.Codex do
   # ── Outbound: ACP → Codex ────────────────────────────────────
 
   @impl true
-  def translate_outbound(%{"method" => "initialize"}, state) do
+  def translate_outbound(%{"method" => "initialize"} = message, state) do
     # Handled by post_connect + bridge synthetic init
-    {:ok, :skip, state}
+    capabilities = get_in(message, ["params", "clientCapabilities"]) || %{}
+    {:ok, :skip, %{state | client_capabilities: capabilities}}
   end
 
   def translate_outbound(
@@ -294,6 +299,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
       |> maybe_put("approvalPolicy", params["approvalPolicy"])
       |> maybe_put("sandbox", thread_sandbox(params, state))
       |> maybe_put("config", mcp_config(params["mcpServers"]))
+      |> maybe_put("dynamicTools", FileLane.tools(state.client_capabilities))
 
     request = encode_request(id, "thread/start", wire_params)
     state = track_request(state, id, :thread_start, acp_id)
@@ -374,6 +380,10 @@ defmodule ExMCP.ACP.Adapters.Codex do
         %{"method" => "session/cancel", "params" => params},
         state
       ) do
+    # ACP file replies can race cancellation. Drop their correlations before
+    # interrupting the turn so a late host response can never complete a tool
+    # call that Codex has already abandoned.
+    state = %{state | pending_client_requests: %{}}
     thread_id = params["sessionId"] || state.thread_id
     turn_id = params["turnId"] || state.turn_id
 
@@ -418,6 +428,17 @@ defmodule ExMCP.ACP.Adapters.Codex do
 
   def translate_outbound(%{"method" => "session/set_config_option"}, state) do
     {:ok, :skip, state}
+  end
+
+  def translate_outbound(%{"id" => response_id} = response, state) do
+    case Map.pop(state.pending_client_requests, response_id) do
+      {nil, _pending} ->
+        {:ok, :skip, state}
+
+      {request, pending} ->
+        state = %{state | pending_client_requests: pending}
+        handle_client_file_response(request, response, state)
+    end
   end
 
   def translate_outbound(_msg, state) do
@@ -533,7 +554,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
   end
 
   defp handle_typed_response(:turn_interrupt, _entry, _reply, state) do
-    {:skip, state}
+    {:skip, %{state | pending_client_requests: %{}}}
   end
 
   defp error_response(acp_id, error) do
@@ -560,6 +581,24 @@ defmodule ExMCP.ACP.Adapters.Codex do
            "code" => -32_002,
            "message" => "Codex did not activate the required permission profile #{expected}."
          }}
+    end
+  end
+
+  defp put_pending_client_request(state, request_id, request) do
+    %{
+      state
+      | pending_client_requests: Map.put(state.pending_client_requests, request_id, request)
+    }
+  end
+
+  defp handle_client_file_response(request, response, state) do
+    case FileLane.handle_response(request, response) do
+      {:reply, result} ->
+        {:ok, [Jason.encode!(result), "\n"], state}
+
+      {:request, next_request, next_pending} ->
+        state = put_pending_client_request(state, next_request["id"], next_pending)
+        {:messages, [next_request], state}
     end
   end
 
@@ -597,6 +636,26 @@ defmodule ExMCP.ACP.Adapters.Codex do
 
     {:skip_and_write,
      jsonrpc_result(id, %{"action" => action, "content" => content, "_meta" => nil}), state}
+  end
+
+  defp handle_server_request("item/tool/call", id, params, state) do
+    session_id = state.thread_id || "default"
+
+    case FileLane.begin_call(
+           params,
+           id,
+           state.client_capabilities,
+           session_id,
+           state.pending_client_requests
+         ) do
+      {:ok, request, pending} ->
+        state = put_pending_client_request(state, request["id"], pending)
+        {:messages, [request], state}
+
+      {:error, reason} ->
+        result = FileLane.tool_result(id, false, reason)
+        {:skip_and_write, [Jason.encode!(result), "\n"], state}
+    end
   end
 
   defp handle_server_request(method, id, _params, state)
@@ -743,6 +802,24 @@ defmodule ExMCP.ACP.Adapters.Codex do
         "kind" => codex_tool_kind(item["name"]),
         "rawInput" => item["arguments"],
         "status" => "pending"
+      })
+
+    {:messages, [notification], state}
+  end
+
+  defp handle_notification(
+         "item/started",
+         %{"item" => %{"type" => "dynamicToolCall"} = item},
+         state
+       ) do
+    notification =
+      session_update(state, %{
+        "sessionUpdate" => "tool_call",
+        "toolCallId" => item["callId"] || item["id"],
+        "title" => item["tool"],
+        "kind" => codex_tool_kind(item["tool"]),
+        "rawInput" => item["arguments"],
+        "status" => "in_progress"
       })
 
     {:messages, [notification], state}
@@ -907,6 +984,7 @@ defmodule ExMCP.ACP.Adapters.Codex do
       | accumulated_text: [],
         accumulated_thinking: [],
         accumulated_usage: nil,
+        pending_client_requests: %{},
         turn_id: nil,
         current_prompt_acp_id: nil
     }
@@ -1080,6 +1158,25 @@ defmodule ExMCP.ACP.Adapters.Codex do
     {:messages, [notification], state}
   end
 
+  defp handle_item_completed(%{"type" => "dynamicToolCall"} = item, state) do
+    failed? = item["status"] == "failed" or item["error"] != nil
+    output = dynamic_item_output(item)
+
+    notification =
+      session_update(state, %{
+        "sessionUpdate" => "tool_call_update",
+        "toolCallId" => item["callId"] || item["id"],
+        "toolName" => item["tool"],
+        "status" => if(failed?, do: "failed", else: "completed"),
+        "kind" => codex_tool_kind(item["tool"]),
+        "rawInput" => item["arguments"],
+        "rawOutput" => item["output"] || item["contentItems"] || item["error"],
+        "content" => [tool_text_content(output)]
+      })
+
+    {:messages, [notification], state}
+  end
+
   defp handle_item_completed(%{"type" => "commandExecution"} = item, state) do
     exit_code = item["exitCode"]
     output = item["aggregatedOutput"] || item["output"] || ""
@@ -1192,6 +1289,25 @@ defmodule ExMCP.ACP.Adapters.Codex do
       "oldText" => nil,
       "newText" => to_string(new_text || "")
     }
+  end
+
+  defp dynamic_item_output(item) do
+    case item["output"] || item["contentItems"] || item["error"] do
+      content when is_binary(content) ->
+        content
+
+      content when is_list(content) ->
+        Enum.map_join(content, "\n", fn
+          %{"text" => text} when is_binary(text) -> text
+          value -> Jason.encode!(value)
+        end)
+
+      nil ->
+        ""
+
+      value ->
+        Jason.encode!(value)
+    end
   end
 
   defp command_title(command) when is_binary(command) and command != "", do: command

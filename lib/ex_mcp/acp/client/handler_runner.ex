@@ -23,8 +23,8 @@ defmodule ExMCP.ACP.Client.HandlerRunner do
     GenServer.cast(pid, {:file_read, ref, session_id, path, opts})
   end
 
-  def file_write(pid, ref, session_id, path, content) do
-    GenServer.cast(pid, {:file_write, ref, session_id, path, content})
+  def file_write(pid, ref, session_id, path, content, opts) do
+    GenServer.cast(pid, {:file_write, ref, session_id, path, content, opts})
   end
 
   def terminal_request(pid, ref, method, params, id) do
@@ -117,10 +117,20 @@ defmodule ExMCP.ACP.Client.HandlerRunner do
     {:noreply, state}
   end
 
-  def handle_cast({:file_write, ref, session_id, path, content}, state) do
+  def handle_cast({:file_write, ref, session_id, path, content, opts}, state) do
     {result, state} =
       case safe_call(fn ->
-             state.handler_mod.handle_file_write(session_id, path, content, state.handler_state)
+             if function_exported?(state.handler_mod, :handle_file_write, 5) do
+               state.handler_mod.handle_file_write(
+                 session_id,
+                 path,
+                 content,
+                 opts,
+                 state.handler_state
+               )
+             else
+               state.handler_mod.handle_file_write(session_id, path, content, state.handler_state)
+             end
            end) do
         {:ok, {:ok, handler_state}} ->
           {:ok, %{state | handler_state: handler_state}}
