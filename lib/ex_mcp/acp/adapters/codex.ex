@@ -270,7 +270,8 @@ defmodule ExMCP.ACP.Adapters.Codex do
         "clientInfo" => %{
           "name" => client_name,
           "version" => client_version
-        }
+        },
+        "capabilities" => %{"experimentalApi" => true}
       })
 
     state = track_request(state, id, :initialize, nil)

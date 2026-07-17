@@ -3,6 +3,14 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
 
   alias ExMCP.ACP.Adapters.Codex
 
+  test "initialize opts into the experimental API required by dynamic tools" do
+    {:ok, state} = Codex.init([])
+
+    assert {:ok, request, _state} = Codex.post_connect(state)
+
+    assert get_in(decode(request), ["params", "capabilities", "experimentalApi"]) == true
+  end
+
   test "advertised ACP filesystem capabilities become Codex dynamic tools" do
     state = initialized_state(%{"fs" => %{"readTextFile" => true, "writeTextFile" => true}})
 
