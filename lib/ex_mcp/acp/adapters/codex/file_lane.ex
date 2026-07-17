@@ -14,19 +14,27 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
     case params do
       %{"tool" => "read_text_file", "arguments" => arguments} when is_map(arguments) ->
         with :ok <- require_capability(capabilities, "readTextFile"),
-             {:ok, path} <- required_binary(arguments, "path") do
-          request =
-            file_request(
-              "fs/read_text_file",
-              %{"sessionId" => session_id, "path" => path}
+             {:ok, path} <- required_binary(arguments, "path"),
+             :ok <- validate_read_window(arguments) do
+          params = %{"sessionId" => session_id, "path" => path}
+
+          params =
+            if is_integer(arguments["line"]) or is_integer(arguments["limit"]) do
+              params
               |> Map.put("line", bounded_integer(arguments["line"], 1, 1, 2_000_000_000))
               |> Map.put("limit", bounded_integer(arguments["limit"], 200, 1, 2_000))
-            )
+            else
+              params
+            end
+
+          request =
+            file_request("fs/read_text_file", params)
 
           {:ok, request,
            %{
              kind: :read,
              codex_id: codex_id,
+             offset_chars: bounded_integer(arguments["offset"], 0, 0, 2_000_000_000),
              max_chars: bounded_integer(arguments["max_chars"], 200_000, 1, 500_000)
            }}
         end
@@ -83,9 +91,7 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
   def handle_response(%{kind: :read, codex_id: codex_id} = request, response) do
     case file_content(response) do
       {:ok, content} ->
-        {content, truncated?} = truncate_text(content, request.max_chars)
-        suffix = if truncated?, do: "\n[truncated by ACP file broker]", else: ""
-        {:reply, tool_result(codex_id, true, content <> suffix)}
+        {:reply, tool_result(codex_id, true, read_chunk(content, request))}
 
       {:error, reason} ->
         {:reply, tool_result(codex_id, false, reason)}
@@ -163,13 +169,14 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
       "type" => "function",
       "name" => "read_text_file",
       "description" =>
-        "Read a workspace text file through the host ACP client. Use this instead of shell commands. Lines are 1-based and bounded.",
+        "Read a workspace text file through the host ACP client. Use offset/max_chars to page through compact one-line JSONL; line/limit are for ordinary multiline text. Never use shell commands.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
           "path" => %{"type" => "string"},
           "line" => %{"type" => "integer", "minimum" => 1},
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 2_000},
+          "offset" => %{"type" => "integer", "minimum" => 0},
           "max_chars" => %{"type" => "integer", "minimum" => 1, "maximum" => 500_000}
         },
         "required" => ["path"],
@@ -183,7 +190,7 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
       "type" => "function",
       "name" => "search_text_file",
       "description" =>
-        "Search one text file through ACP and return bounded matching lines. Use this instead of rg, grep, jq, or document extractors.",
+        "Search one text file through ACP and return bounded literal occurrences with surrounding context. Use this instead of rg, grep, jq, or document extractors.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -260,6 +267,15 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
   defp required_edits(_edits),
     do: {:error, "edits must contain 1 to #{@max_edits} replacements"}
 
+  defp validate_read_window(arguments) do
+    if is_integer(arguments["offset"]) and
+         (is_integer(arguments["line"]) or is_integer(arguments["limit"])) do
+      {:error, "offset cannot be combined with line or limit"}
+    else
+      :ok
+    end
+  end
+
   defp bounded_integer(value, default, minimum, maximum) when not is_integer(value),
     do: bounded_integer(default, default, minimum, maximum)
 
@@ -288,37 +304,100 @@ defmodule ExMCP.ACP.Adapters.Codex.FileLane do
   defp client_error_message(%{"message" => message}) when is_binary(message), do: message
   defp client_error_message(error), do: inspect(error)
 
-  defp truncate_text(text, max_chars) do
-    if String.length(text) > max_chars,
-      do: {String.slice(text, 0, max_chars), true},
-      else: {text, false}
+  defp read_chunk(content, request) do
+    total_chars = String.length(content)
+    offset = min(request.offset_chars, total_chars)
+    chunk = String.slice(content, offset, request.max_chars)
+    next_offset = offset + String.length(chunk)
+
+    if next_offset < total_chars do
+      chunk <>
+        "\n[ACP chunk chars #{offset}-#{next_offset - 1} of #{total_chars}; continue with offset #{next_offset}]"
+    else
+      chunk
+    end
   end
 
   defp search_text(content, query, max_results) do
-    matches =
+    {matches, remaining_matches} =
       content
-      |> String.split("\n", trim: false)
+      |> bounded_literal_matches(query, max_results + 1)
+      |> Enum.split(max_results)
+
+    results =
+      matches
       |> Enum.with_index(1)
-      |> Enum.filter(fn {line, _line_number} -> String.contains?(line, query) end)
-      |> Enum.take(max_results)
-      |> Enum.map_join("\n", fn {line, line_number} ->
-        "line #{line_number}: #{matching_line_snippet(line, query)}"
+      |> Enum.map_join("\n\n", fn {{offset, length}, match_number} ->
+        "match #{match_number} at byte #{offset}: " <>
+          matching_occurrence_snippet(content, offset, length)
       end)
 
-    if matches == "", do: "No literal matches.", else: matches
-  end
+    cond do
+      results == "" ->
+        "No literal matches."
 
-  defp matching_line_snippet(line, query) do
-    case String.split(line, query, parts: 2) do
-      [before, remainder] ->
-        prefix = String.slice(before, max(String.length(before) - 1_000, 0), 1_000)
-        suffix = String.slice(remainder, 0, 1_000)
-        prefix <> query <> suffix
+      remaining_matches == [] ->
+        results
 
-      _other ->
-        String.slice(line, 0, 2_000)
+      true ->
+        results <> "\n\n[More literal matches exist; refine the query or increase max_results.]"
     end
   end
+
+  defp bounded_literal_matches(content, query, limit),
+    do: bounded_literal_matches(content, query, 0, limit, [])
+
+  defp bounded_literal_matches(_content, _query, _offset, 0, matches),
+    do: Enum.reverse(matches)
+
+  defp bounded_literal_matches(content, query, offset, remaining, matches)
+       when offset < byte_size(content) do
+    case :binary.match(content, query, scope: {offset, byte_size(content) - offset}) do
+      {match_offset, match_length} ->
+        bounded_literal_matches(
+          content,
+          query,
+          match_offset + match_length,
+          remaining - 1,
+          [{match_offset, match_length} | matches]
+        )
+
+      :nomatch ->
+        Enum.reverse(matches)
+    end
+  end
+
+  defp bounded_literal_matches(_content, _query, _offset, _remaining, matches),
+    do: Enum.reverse(matches)
+
+  defp matching_occurrence_snippet(content, offset, match_length) do
+    content_size = byte_size(content)
+    start_offset = utf8_start(content, max(offset - 1_200, 0))
+    end_offset = utf8_end(content, min(offset + match_length + 1_200, content_size))
+    snippet = binary_part(content, start_offset, end_offset - start_offset)
+
+    prefix = if start_offset > 0, do: "…", else: ""
+    suffix = if end_offset < content_size, do: "…", else: ""
+    prefix <> snippet <> suffix
+  end
+
+  defp utf8_start(content, offset) when offset < byte_size(content) do
+    if continuation_byte?(:binary.at(content, offset)),
+      do: utf8_start(content, offset + 1),
+      else: offset
+  end
+
+  defp utf8_start(_content, offset), do: offset
+
+  defp utf8_end(content, offset) when offset > 0 and offset < byte_size(content) do
+    if continuation_byte?(:binary.at(content, offset)),
+      do: utf8_end(content, offset - 1),
+      else: offset
+  end
+
+  defp utf8_end(_content, offset), do: offset
+
+  defp continuation_byte?(byte), do: byte >= 0x80 and byte <= 0xBF
 
   defp apply_exact_edits(content, edits) do
     Enum.reduce_while(edits, {:ok, content, 0}, fn edit, {:ok, current, total} ->

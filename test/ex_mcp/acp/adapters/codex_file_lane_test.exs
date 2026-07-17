@@ -78,6 +78,67 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
            } = decode(response)
   end
 
+  test "read_text_file pages through compact one-line JSONL by character offset" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+
+    assert {:messages, [request], state} =
+             dynamic_call(state, 410, "read_text_file", %{
+               "path" => "contract.jsonl",
+               "offset" => 3,
+               "max_chars" => 4
+             })
+
+    refute Map.has_key?(request["params"], "line")
+    refute Map.has_key?(request["params"], "limit")
+
+    assert {:ok, response, _state} =
+             Codex.translate_outbound(
+               %{"id" => request["id"], "result" => %{"content" => "가나다라마바사"}},
+               state
+             )
+
+    result = get_in(decode(response), ["result", "contentItems", Access.at(0), "text"])
+
+    assert result == "라마바사"
+  end
+
+  test "read_text_file returns the next offset when a chunk remains" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+
+    assert {:messages, [request], state} =
+             dynamic_call(state, 411, "read_text_file", %{
+               "path" => "contract.jsonl",
+               "offset" => 2,
+               "max_chars" => 3
+             })
+
+    assert {:ok, response, _state} =
+             Codex.translate_outbound(
+               %{"id" => request["id"], "result" => %{"content" => "abcdefgh"}},
+               state
+             )
+
+    result = get_in(decode(response), ["result", "contentItems", Access.at(0), "text"])
+
+    assert result == "cde\n[ACP chunk chars 2-4 of 8; continue with offset 5]"
+  end
+
+  test "read_text_file rejects ambiguous line and offset paging" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+
+    assert {:skip_and_write, response, _state} =
+             dynamic_call(state, 412, "read_text_file", %{
+               "path" => "contract.jsonl",
+               "line" => 1,
+               "offset" => 0
+             })
+
+    assert get_in(decode(response), ["result", "success"]) == false
+
+    assert get_in(decode(response), ["result", "contentItems", Access.at(0), "text"]) =~
+             "offset cannot be combined"
+  end
+
   test "search_text_file searches ACP-provided content without a shell" do
     state = initialized_state(%{"fs" => %{"readTextFile" => true}})
 
@@ -96,8 +157,86 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneTest do
                state
              )
 
-    assert get_in(decode(response), ["result", "contentItems", Access.at(0), "text"]) ==
-             "line 2: 계약명: 빈칸"
+    result = get_in(decode(response), ["result", "contentItems", Access.at(0), "text"])
+
+    assert result =~ "match 1 at byte"
+    assert result =~ "첫 줄\n계약명: 빈칸\n끝"
+  end
+
+  test "search_text_file enumerates repeated matches inside one compact JSON line" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+
+    assert {:messages, [request], state} =
+             dynamic_call(state, 420, "search_text_file", %{
+               "path" => "contract.jsonl",
+               "query" => "(인)"
+             })
+
+    assert {:ok, response, _state} =
+             Codex.translate_outbound(
+               %{
+                 "id" => request["id"],
+                 "result" => %{
+                   "content" => ~s|{"text":"갑 (인)","other":"을 (인)","last":"병 (인)"}|
+                 }
+               },
+               state
+             )
+
+    result = get_in(decode(response), ["result", "contentItems", Access.at(0), "text"])
+
+    assert result =~ "match 1 at byte"
+    assert result =~ "match 2 at byte"
+    assert result =~ "match 3 at byte"
+
+    assert length(Regex.scan(~r/match \d+ at byte/, result)) == 3
+  end
+
+  test "search_text_file keeps UTF-8 snippets valid at bounded byte edges" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+
+    assert {:messages, [request], state} =
+             dynamic_call(state, 421, "search_text_file", %{
+               "path" => "contract.jsonl",
+               "query" => "(인)"
+             })
+
+    content = String.duplicate("가", 500) <> "(인)" <> String.duplicate("나", 500)
+
+    assert {:ok, response, _state} =
+             Codex.translate_outbound(
+               %{"id" => request["id"], "result" => %{"content" => content}},
+               state
+             )
+
+    result = get_in(decode(response), ["result", "contentItems", Access.at(0), "text"])
+
+    assert String.valid?(result)
+    assert result =~ "(인)"
+  end
+
+  test "search_text_file bounds work and reports undisplayed occurrences" do
+    state = initialized_state(%{"fs" => %{"readTextFile" => true}})
+
+    assert {:messages, [request], state} =
+             dynamic_call(state, 422, "search_text_file", %{
+               "path" => "contract.jsonl",
+               "query" => "(인)",
+               "max_results" => 2
+             })
+
+    content = Enum.map_join(1..100, " ", &"#{&1}(인)")
+
+    assert {:ok, response, _state} =
+             Codex.translate_outbound(
+               %{"id" => request["id"], "result" => %{"content" => content}},
+               state
+             )
+
+    result = get_in(decode(response), ["result", "contentItems", Access.at(0), "text"])
+
+    assert length(Regex.scan(~r/match \d+ at byte/, result)) == 2
+    assert result =~ "More literal matches exist"
   end
 
   test "edit_text_file performs exact replacements between ACP read and host write" do

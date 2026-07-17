@@ -30,9 +30,7 @@ defmodule ExMCP.ACP.Adapters.CodexFileLaneBridgeTest do
 
     task = Task.async(fn -> Client.prompt(client, session_id, "read the brief") end)
 
-    assert_receive {:fake_file_read, ^session_id, "brief.md", %{"line" => 1, "limit" => 200}},
-                   5_000
-
+    assert_receive {:fake_file_read, ^session_id, "brief.md", %{}}, 5_000
     assert_receive {:fake_file_read, ^session_id, "brief.md", %{}}, 5_000
 
     expected_sha256 =
