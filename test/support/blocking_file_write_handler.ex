@@ -1,0 +1,29 @@
+defmodule ExMCP.Test.BlockingFileWriteHandler do
+  @behaviour ExMCP.ACP.Client.Handler
+
+  @impl true
+  def init(opts), do: {:ok, %{test_pid: Keyword.fetch!(opts, :test_pid)}}
+
+  @impl true
+  def handle_session_update(_session_id, _update, state), do: {:ok, state}
+
+  @impl true
+  def handle_permission_request(_session_id, _tool_call, _options, state) do
+    {:ok, %{"outcome" => "cancelled"}, state}
+  end
+
+  @impl true
+  def handle_file_read(_session_id, _path, _opts, state), do: {:ok, "", state}
+
+  @impl true
+  def handle_file_write(_session_id, path, content, _opts, state) do
+    send(state.test_pid, {:blocking_file_write_started, self()})
+
+    receive do
+      :finish_file_write ->
+        File.write!(path, content)
+        send(state.test_pid, {:blocking_file_write_finished, self()})
+        {:ok, state}
+    end
+  end
+end

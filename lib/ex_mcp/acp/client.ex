@@ -32,6 +32,8 @@ defmodule ExMCP.ACP.Client do
 
   require Logger
 
+  @handler_stop_timeout 100
+
   alias ExMCP.ACP.Client.DefaultHandler
   alias ExMCP.ACP.Client.HandlerRunner
   alias ExMCP.ACP.Protocol
@@ -359,7 +361,7 @@ defmodule ExMCP.ACP.Client do
   end
 
   def handle_call(:disconnect, _from, state) do
-    state = do_disconnect(state)
+    state = state |> stop_handler_runner() |> do_disconnect()
     {:reply, :ok, state}
   end
 
@@ -408,13 +410,16 @@ defmodule ExMCP.ACP.Client do
 
   def handle_info({:transport_closed, _reason}, state) do
     Logger.info("ACP transport closed")
+    state = stop_handler_runner(state)
     state = reply_all_pending({:error, :transport_closed}, state)
     {:noreply, %{state | status: :disconnected}}
   end
 
   def handle_info({:transport_error, reason}, state) do
     Logger.warning("ACP transport error: #{inspect(reason)}")
+    state = stop_handler_runner(state)
     state = reply_all_pending({:error, {:transport_error, reason}}, state)
+
     {:noreply, %{state | status: :disconnected}}
   end
 
@@ -425,6 +430,7 @@ defmodule ExMCP.ACP.Client do
           Logger.warning("ACP receiver exited: #{inspect(reason)}")
         end
 
+        state = stop_handler_runner(state)
         state = reply_all_pending({:error, :receiver_exited}, state)
         {:noreply, %{state | status: :disconnected, receiver_pid: nil}}
 
@@ -442,11 +448,42 @@ defmodule ExMCP.ACP.Client do
 
   @impl true
   def terminate(_reason, state) do
+    stop_handler_runner(state.handler_pid)
     do_disconnect(state)
     :ok
   end
 
   # Private helpers
+
+  defp stop_handler_runner(pid) when is_pid(pid) do
+    # Give an idle runner a normal terminate callback, but do not let a handler
+    # blocked in filesystem/user code keep mutating after its ACP client closes.
+    monitor_ref = Process.monitor(pid)
+
+    _ =
+      try do
+        GenServer.stop(pid, :shutdown, @handler_stop_timeout)
+      catch
+        :exit, _reason -> :ok
+      end
+
+    if Process.alive?(pid), do: Process.exit(pid, :kill)
+
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+    after
+      @handler_stop_timeout -> Process.demonitor(monitor_ref, [:flush])
+    end
+  end
+
+  defp stop_handler_runner(%__MODULE__{} = state) do
+    # disconnect/transport loss is terminal for this Client process (there is
+    # no reconnect API), so no queued agent request may retain the handler.
+    stop_handler_runner(state.handler_pid)
+    %{state | handler_pid: nil, pending_agent_requests: %{}}
+  end
+
+  defp stop_handler_runner(_pid), do: :ok
 
   defp connect_and_initialize(opts, state) do
     transport_opts = build_transport_opts(opts)

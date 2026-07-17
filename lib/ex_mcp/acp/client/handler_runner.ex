@@ -33,8 +33,9 @@ defmodule ExMCP.ACP.Client.HandlerRunner do
 
   @impl true
   def init({handler_mod, handler_opts, owner}) do
-    Process.flag(:trap_exit, true)
-
+    # Keep the owner link fatal. A file handler can be blocked in user code, so
+    # trapping the client's exit would let that callback outlive cancellation.
+    # Normal client shutdown stops this runner explicitly in Client.terminate/2.
     case safe_call(fn -> handler_mod.init(handler_opts) end) do
       {:ok, {:ok, handler_state}} ->
         {:ok, %__MODULE__{handler_mod: handler_mod, handler_state: handler_state, owner: owner}}
